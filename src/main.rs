@@ -19,7 +19,7 @@ use serde_json::{Value, json};
 const GLOBAL_ID_RADIX: i64 = 0x1000000;
 const GPU_PROCESS_ID_BASE: i64 = 2_000_000_000;
 const LAUNCH_FLOW_ID_BASE: u64 = 1_u64 << 51;
-const STREAM_FLOW_ID_BASE: u64 = 2_u64 << 51;
+const MEMCPY_FLOW_ID_BASE: u64 = 2_u64 << 51;
 
 #[derive(Parser, Debug)]
 #[command(about = "Convert Nsight Parquet tables to Perfetto JSON with DataFusion")]
@@ -50,9 +50,32 @@ struct Kernel {
     block: [i64; 3],
     sequence: u64,
     event_id: String,
-    predecessor: Option<usize>,
     launch_call: Option<usize>,
     nvtx_regions: Vec<String>,
+}
+
+#[derive(Debug)]
+struct Memcpy {
+    start: i64,
+    end: i64,
+    device: i64,
+    context: i64,
+    stream: i64,
+    correlation: i64,
+    global_pid: i64,
+    bytes: u64,
+    copy_kind: i64,
+    src_kind: i64,
+    dst_kind: i64,
+    src_device: i64,
+    src_context: i64,
+    dst_device: i64,
+    dst_context: i64,
+    graph_node: i64,
+    virtual_address: String,
+    copy_count: u64,
+    event_id: String,
+    launch_call: Option<usize>,
 }
 
 #[derive(Debug)]
@@ -195,7 +218,7 @@ fn string_at(batch: &RecordBatch, name: &str, row: usize) -> Result<String> {
     bail!("column {name} is neither Utf8 nor Utf8View")
 }
 
-async fn register_tables(ctx: &SessionContext, dir: &Path) -> Result<()> {
+async fn register_tables(ctx: &SessionContext, dir: &Path) -> Result<bool> {
     let tables = [
         ("kernels", "CUPTI_ACTIVITY_KIND_KERNEL.parquet"),
         ("runtime", "CUPTI_ACTIVITY_KIND_RUNTIME.parquet"),
@@ -217,7 +240,18 @@ async fn register_tables(ctx: &SessionContext, dir: &Path) -> Result<()> {
         )
         .await?;
     }
-    Ok(())
+    let memcpy_path = dir.join("CUPTI_ACTIVITY_KIND_MEMCPY.parquet");
+    if memcpy_path.is_file() {
+        ctx.register_parquet(
+            "memcpy",
+            memcpy_path.to_str().context("non-UTF8 Parquet path")?,
+            ParquetReadOptions::default(),
+        )
+        .await?;
+        Ok(true)
+    } else {
+        Ok(false)
+    }
 }
 
 async fn load_kernels(ctx: &SessionContext) -> Result<Vec<Kernel>> {
@@ -271,7 +305,6 @@ async fn load_kernels(ctx: &SessionContext) -> Result<Vec<Kernel>> {
                 block: [bx.value(row), by.value(row), bz.value(row)],
                 sequence: 0,
                 event_id: String::new(),
-                predecessor: None,
                 launch_call: None,
                 nvtx_regions: Vec::new(),
             });
@@ -347,6 +380,79 @@ async fn load_runtime(ctx: &SessionContext) -> Result<Vec<RuntimeCall>> {
     Ok(calls)
 }
 
+async fn load_memcpys(ctx: &SessionContext) -> Result<Vec<Memcpy>> {
+    let sql = r#"
+        SELECT
+            CAST(start AS BIGINT) AS start_ns,
+            CAST("end" AS BIGINT) AS end_ns,
+            CAST("deviceId" AS BIGINT) AS device_id,
+            CAST("contextId" AS BIGINT) AS context_id,
+            CAST("streamId" AS BIGINT) AS stream_id,
+            CAST("correlationId" AS BIGINT) AS correlation_id,
+            CAST("globalPid" AS BIGINT) AS global_pid,
+            CAST(bytes AS BIGINT) AS bytes,
+            CAST("copyKind" AS BIGINT) AS copy_kind,
+            CAST("srcKind" AS BIGINT) AS src_kind,
+            CAST("dstKind" AS BIGINT) AS dst_kind,
+            COALESCE(CAST("srcDeviceId" AS BIGINT), -1) AS src_device_id,
+            COALESCE(CAST("srcContextId" AS BIGINT), -1) AS src_context_id,
+            COALESCE(CAST("dstDeviceId" AS BIGINT), -1) AS dst_device_id,
+            COALESCE(CAST("dstContextId" AS BIGINT), -1) AS dst_context_id,
+            COALESCE(CAST("graphNodeId" AS BIGINT), -1) AS graph_node_id,
+            COALESCE(CAST("virtualAddress" AS VARCHAR), '0') AS virtual_address,
+            COALESCE(CAST("copyCount" AS BIGINT), 1) AS copy_count
+        FROM memcpy
+        WHERE CAST("copyKind" AS BIGINT) IN (1, 2, 3, 8, 11, 12, 13)
+        ORDER BY start_ns, end_ns, correlation_id
+    "#;
+    let batches = ctx.sql(sql).await?.collect().await?;
+    let mut copies = Vec::new();
+    for batch in batches {
+        let start = i64_col(&batch, "start_ns")?;
+        let end = i64_col(&batch, "end_ns")?;
+        let device = i64_col(&batch, "device_id")?;
+        let context = i64_col(&batch, "context_id")?;
+        let stream = i64_col(&batch, "stream_id")?;
+        let correlation = i64_col(&batch, "correlation_id")?;
+        let global_pid = i64_col(&batch, "global_pid")?;
+        let bytes = i64_col(&batch, "bytes")?;
+        let copy_kind = i64_col(&batch, "copy_kind")?;
+        let src_kind = i64_col(&batch, "src_kind")?;
+        let dst_kind = i64_col(&batch, "dst_kind")?;
+        let src_device = i64_col(&batch, "src_device_id")?;
+        let src_context = i64_col(&batch, "src_context_id")?;
+        let dst_device = i64_col(&batch, "dst_device_id")?;
+        let dst_context = i64_col(&batch, "dst_context_id")?;
+        let graph_node = i64_col(&batch, "graph_node_id")?;
+        let copy_count = i64_col(&batch, "copy_count")?;
+        for row in 0..batch.num_rows() {
+            copies.push(Memcpy {
+                start: start.value(row),
+                end: end.value(row),
+                device: device.value(row),
+                context: context.value(row),
+                stream: stream.value(row),
+                correlation: correlation.value(row),
+                global_pid: global_pid.value(row),
+                bytes: bytes.value(row) as u64,
+                copy_kind: copy_kind.value(row),
+                src_kind: src_kind.value(row),
+                dst_kind: dst_kind.value(row),
+                src_device: src_device.value(row),
+                src_context: src_context.value(row),
+                dst_device: dst_device.value(row),
+                dst_context: dst_context.value(row),
+                graph_node: graph_node.value(row),
+                virtual_address: string_at(&batch, "virtual_address", row)?,
+                copy_count: copy_count.value(row) as u64,
+                event_id: String::new(),
+                launch_call: None,
+            });
+        }
+    }
+    Ok(copies)
+}
+
 #[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 enum BoundaryKind {
     ApiEnd,
@@ -355,11 +461,12 @@ enum BoundaryKind {
     NvtxStart,
 }
 
-fn link_runtime_calls_to_kernels(
+fn link_runtime_calls_to_gpu_activities(
     report: &str,
     kernels: &mut [Kernel],
+    memcpys: &mut [Memcpy],
     runtime: &mut [RuntimeCall],
-) -> usize {
+) -> (usize, usize) {
     let mut calls_by_process_correlation: HashMap<(i64, i64), Vec<usize>> = HashMap::new();
     for (idx, call) in runtime.iter().enumerate() {
         let pid = (call.global_tid / GLOBAL_ID_RADIX) % GLOBAL_ID_RADIX;
@@ -369,7 +476,7 @@ fn link_runtime_calls_to_kernels(
             .push(idx);
     }
 
-    let mut links = 0;
+    let mut kernel_links = 0;
     for kernel in kernels {
         let pid = (kernel.global_pid / GLOBAL_ID_RADIX) % GLOBAL_ID_RADIX;
         let Some(candidates) = calls_by_process_correlation.get(&(pid, kernel.correlation)) else {
@@ -391,9 +498,37 @@ fn link_runtime_calls_to_kernels(
             ));
         }
         kernel.launch_call = Some(call_idx);
-        links += 1;
+        kernel_links += 1;
     }
-    links
+
+    let mut memcpy_links = 0;
+    for (copy_idx, copy) in memcpys.iter_mut().enumerate() {
+        copy.event_id = format!(
+            "{report}:cuda_memcpy:{}:{}:{}:{copy_idx}",
+            copy.device, copy.context, copy.stream
+        );
+        let pid = (copy.global_pid / GLOBAL_ID_RADIX) % GLOBAL_ID_RADIX;
+        let Some(candidates) = calls_by_process_correlation.get(&(pid, copy.correlation)) else {
+            continue;
+        };
+        let Some(&call_idx) = candidates.iter().min_by_key(|&&idx| {
+            let call = &runtime[idx];
+            (call.start > copy.start, call.start.abs_diff(copy.start))
+        }) else {
+            continue;
+        };
+        if runtime[call_idx].event_id.is_none() {
+            let call = &runtime[call_idx];
+            let tid = call.global_tid % GLOBAL_ID_RADIX;
+            runtime[call_idx].event_id = Some(format!(
+                "{report}:cuda_api:{pid}:{tid}:{}:{call_idx}",
+                call.correlation
+            ));
+        }
+        copy.launch_call = Some(call_idx);
+        memcpy_links += 1;
+    }
+    (kernel_links, memcpy_links)
 }
 
 fn project_nvtx_to_kernels(
@@ -514,7 +649,6 @@ mod tests {
             block: [1, 1, 1],
             sequence: 0,
             event_id: String::new(),
-            predecessor: None,
             launch_call: None,
             nvtx_regions: Vec::new(),
         }
@@ -554,9 +688,15 @@ mod tests {
             },
         ];
 
+        let mut memcpys = Vec::new();
         assert_eq!(
-            link_runtime_calls_to_kernels("report", &mut kernels, &mut runtime),
-            2
+            link_runtime_calls_to_gpu_activities(
+                "report",
+                &mut kernels,
+                &mut memcpys,
+                &mut runtime
+            ),
+            (2, 0)
         );
         project_nvtx_to_kernels(&mut kernels, &mut nvtx, &runtime);
 
@@ -569,17 +709,18 @@ mod tests {
         assert_eq!(kernels[1].nvtx_regions, ["multi_gpu_range"]);
 
         runtime[1].end = kernels[1].start + 10;
-        let flow_start = launch_flow_start_ns(&runtime[1], &kernels[1]);
+        let flow_start = flow_start_ns(&runtime[1], kernels[1].start);
         assert!(flow_start >= runtime[1].start);
         assert!(flow_start < kernels[1].start);
     }
 }
 
-fn assign_stream_dependencies(report: &str, kernels: &mut [Kernel]) {
-    let mut previous: HashMap<(i64, i64, i64), usize> = HashMap::new();
-    let mut sequence: HashMap<(i64, i64, i64), u64> = HashMap::new();
+fn assign_kernel_ids(report: &str, kernels: &mut [Kernel]) {
+    let mut sequence: HashMap<(i64, i64, i64, i64), u64> = HashMap::new();
     for idx in 0..kernels.len() {
+        let source_pid = (kernels[idx].global_pid / GLOBAL_ID_RADIX) % GLOBAL_ID_RADIX;
         let key = (
+            source_pid,
             kernels[idx].device,
             kernels[idx].context,
             kernels[idx].stream,
@@ -588,10 +729,9 @@ fn assign_stream_dependencies(report: &str, kernels: &mut [Kernel]) {
         *seq += 1;
         kernels[idx].sequence = *seq;
         kernels[idx].event_id = format!(
-            "{report}:cuda:{}:{}:{}:{}",
+            "{report}:cuda:{source_pid}:{}:{}:{}:{}",
             kernels[idx].device, kernels[idx].context, kernels[idx].stream, seq
         );
-        kernels[idx].predecessor = previous.insert(key, idx);
     }
 }
 
@@ -599,75 +739,161 @@ fn ns_to_us(ns: i64) -> f64 {
     ns as f64 / 1000.0
 }
 
-fn gpu_process_id(device: i64) -> i64 {
-    GPU_PROCESS_ID_BASE + device
+fn flow_start_ns(call: &RuntimeCall, activity_start: i64) -> i64 {
+    (call.end - 1).min(activity_start - 1).max(call.start)
 }
 
-fn launch_flow_start_ns(call: &RuntimeCall, kernel: &Kernel) -> i64 {
-    (call.end - 1).min(kernel.start - 1).max(call.start)
+fn source_pid(global_pid: i64) -> i64 {
+    (global_pid / GLOBAL_ID_RADIX) % GLOBAL_ID_RADIX
+}
+
+fn copy_direction(copy_kind: i64) -> &'static str {
+    match copy_kind {
+        1 => "H2D",
+        2 => "D2H",
+        3 | 8 => "D2D",
+        11 => "Unified H2D",
+        12 => "Unified D2H",
+        13 => "Unified D2D",
+        _ => "Unknown",
+    }
+}
+
+fn memory_kind(kind: i64) -> &'static str {
+    match kind {
+        0 => "Pageable",
+        1 => "Pinned",
+        2 => "Device",
+        3 => "Array",
+        4 => "Managed",
+        5 => "Device Static",
+        6 => "Managed Static",
+        _ => "Unknown",
+    }
 }
 
 fn emit_outputs(
     report: &str,
     output_json: &Path,
     kernels: &[Kernel],
+    memcpys: &[Memcpy],
     runtime: &[RuntimeCall],
     nvtx: &[NvtxRange],
     origin_ns: i64,
     anchor_ns: i64,
 ) -> Result<(Vec<TraceRow>, Vec<DependencyRow>, usize)> {
+    #[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+    enum HostSliceKey {
+        Runtime(usize),
+        Nvtx(usize),
+        ProjectedNvtx(usize, i64),
+    }
+
     let mut writer = JsonArrayWriter::create(output_json)?;
-    let mut rows = Vec::with_capacity(kernels.len() * 2 + nvtx.len() * 2);
-    let mut dependencies = Vec::with_capacity(kernels.len());
+    let mut rows =
+        Vec::with_capacity(kernels.len() + memcpys.len() + runtime.len() + nvtx.len() * 2);
+    let dependencies = Vec::new();
     let mut json_event_count = 0usize;
 
-    let stream_keys: BTreeSet<(i64, i64, i64)> = kernels
+    // A CUDA device ID is process-local. Keep the source process in every GPU
+    // track key so two processes' device 0 never collapse onto one device.
+    let gpu_keys: BTreeSet<(i64, i64)> = kernels
         .iter()
-        .map(|kernel| (kernel.device, kernel.context, kernel.stream))
+        .map(|kernel| (source_pid(kernel.global_pid), kernel.device))
+        .chain(
+            memcpys
+                .iter()
+                .map(|copy| (source_pid(copy.global_pid), copy.device)),
+        )
         .collect();
-    let stream_tracks: BTreeMap<(i64, i64, i64), i64> = stream_keys
+    let gpu_processes: BTreeMap<(i64, i64), i64> = gpu_keys
+        .iter()
+        .enumerate()
+        .map(|(idx, &key)| (key, GPU_PROCESS_ID_BASE + idx as i64))
+        .collect();
+    let stream_keys: BTreeSet<(i64, i64, i64, i64)> = kernels
+        .iter()
+        .map(|kernel| {
+            (
+                source_pid(kernel.global_pid),
+                kernel.device,
+                kernel.context,
+                kernel.stream,
+            )
+        })
+        .chain(memcpys.iter().map(|copy| {
+            (
+                source_pid(copy.global_pid),
+                copy.device,
+                copy.context,
+                copy.stream,
+            )
+        }))
+        .collect();
+    let stream_tracks: BTreeMap<(i64, i64, i64, i64), i64> = stream_keys
         .iter()
         .enumerate()
         .map(|(idx, &key)| (key, idx as i64 + 1))
         .collect();
-    let projected_keys: BTreeSet<(i64, i64, i64)> = nvtx
-        .iter()
-        .flat_map(|range| {
-            range
-                .kernel_bounds
-                .keys()
-                .map(move |&device| (device, range.pid, range.tid))
-        })
-        .collect();
-    let projected_tracks: BTreeMap<(i64, i64, i64), i64> = projected_keys
+    // Chrome complete events cannot overlap on one track. Group all CPU API,
+    // NVTX, and projected NVTX intervals by source thread, then greedily place
+    // them on the minimum number of adjacent lanes. This keeps corresponding
+    // content visually together without Perfetto dropping overlapping slices.
+    let mut host_intervals: BTreeMap<(i64, i64), Vec<(i64, i64, HostSliceKey)>> = BTreeMap::new();
+    for (idx, call) in runtime
         .iter()
         .enumerate()
-        .map(|(idx, &key)| (key, stream_tracks.len() as i64 + idx as i64 + 1))
-        .collect();
-    let gpu_devices: BTreeSet<i64> = kernels.iter().map(|kernel| kernel.device).collect();
-    let mut host_threads: BTreeSet<(i64, i64)> = runtime
-        .iter()
-        .filter(|call| call.event_id.is_some())
-        .map(|call| {
-            (
-                (call.global_tid / GLOBAL_ID_RADIX) % GLOBAL_ID_RADIX,
+        .filter(|(_, call)| call.event_id.is_some())
+    {
+        host_intervals
+            .entry((
+                source_pid(call.global_tid),
                 call.global_tid % GLOBAL_ID_RADIX,
-            )
-        })
-        .collect();
-    host_threads.extend(nvtx.iter().map(|range| (range.pid, range.tid)));
-    let host_processes: BTreeSet<i64> = host_threads.iter().map(|&(pid, _)| pid).collect();
+            ))
+            .or_default()
+            .push((call.start, call.end, HostSliceKey::Runtime(idx)));
+    }
+    for (idx, range) in nvtx.iter().enumerate() {
+        let intervals = host_intervals.entry((range.pid, range.tid)).or_default();
+        intervals.push((range.start, range.end, HostSliceKey::Nvtx(idx)));
+        intervals.extend(range.kernel_bounds.iter().map(|(&device, &(start, end))| {
+            (start, end, HostSliceKey::ProjectedNvtx(idx, device))
+        }));
+    }
+    let host_processes: BTreeSet<i64> = host_intervals.keys().map(|&(pid, _)| pid).collect();
+    let mut host_slice_tracks = BTreeMap::new();
+    let mut host_track_metadata = Vec::new();
+    let mut next_host_track = 1_000_000_000_i64;
+    for (&(pid, source_tid), intervals) in &mut host_intervals {
+        intervals.sort_unstable_by_key(|&(start, end, key)| (start, end, key));
+        let mut lane_ends: Vec<i64> = Vec::new();
+        let mut lane_tids: Vec<i64> = Vec::new();
+        for &(start, end, key) in intervals.iter() {
+            let lane = lane_ends
+                .iter()
+                .position(|&lane_end| lane_end <= start)
+                .unwrap_or_else(|| {
+                    let lane = lane_ends.len();
+                    lane_ends.push(i64::MIN);
+                    lane_tids.push(next_host_track);
+                    host_track_metadata.push((pid, next_host_track, source_tid, lane));
+                    next_host_track += 1;
+                    lane
+                });
+            lane_ends[lane] = end;
+            host_slice_tracks.insert(key, lane_tids[lane]);
+        }
+    }
 
-    for device in gpu_devices {
-        let pid = gpu_process_id(device);
+    for (&(source_pid, device), &pid) in &gpu_processes {
         for (name, args) in [
             (
                 "process_name",
-                json!({"name": format!("CUDA HW Device {device}")}),
+                json!({"name": format!("CUDA HW PID {source_pid} / deviceId {device}")}),
             ),
             (
                 "process_sort_index",
-                json!({"sort_index": -10_000 + device}),
+                json!({"sort_index": -10_000 + pid - GPU_PROCESS_ID_BASE}),
             ),
         ] {
             writer.event(&TraceEvent {
@@ -685,7 +911,7 @@ fn emit_outputs(
             json_event_count += 1;
         }
     }
-    for (&(device, context, stream), &tid) in &stream_tracks {
+    for (&(source_pid, device, context, stream), &tid) in &stream_tracks {
         for (name, args) in [
             (
                 "thread_name",
@@ -700,28 +926,13 @@ fn emit_outputs(
                 ts: 0.0,
                 dur: None,
                 tid,
-                pid: gpu_process_id(device),
+                pid: gpu_processes[&(source_pid, device)],
                 args,
                 id: None,
                 bp: None,
             })?;
             json_event_count += 1;
         }
-    }
-    for (&(device, source_pid, source_tid), &tid) in &projected_tracks {
-        writer.event(&TraceEvent {
-            name: "thread_name".into(),
-            ph: "M".into(),
-            cat: "__metadata".into(),
-            ts: 0.0,
-            dur: None,
-            tid,
-            pid: gpu_process_id(device),
-            args: json!({"name": format!("NVTX Kernel PID {source_pid} / Thread {source_tid}")}),
-            id: None,
-            bp: None,
-        })?;
-        json_event_count += 1;
     }
     for pid in host_processes {
         for (name, args) in [
@@ -746,7 +957,7 @@ fn emit_outputs(
             json_event_count += 1;
         }
     }
-    for (pid, tid) in host_threads {
+    for (pid, tid, source_tid, lane) in host_track_metadata {
         writer.event(&TraceEvent {
             name: "thread_name".into(),
             ph: "M".into(),
@@ -755,18 +966,23 @@ fn emit_outputs(
             dur: None,
             tid,
             pid,
-            args: json!({"name": format!("CUDA API / NVTX Thread {tid}")}),
+            args: json!({"name": format!("CUDA API / NVTX Thread {source_tid} / Lane {}", lane + 1)}),
             id: None,
             bp: None,
         })?;
         json_event_count += 1;
     }
 
-    for call in runtime.iter().filter(|call| call.event_id.is_some()) {
+    for (call_idx, call) in runtime
+        .iter()
+        .enumerate()
+        .filter(|(_, call)| call.event_id.is_some())
+    {
         let pid_number = (call.global_tid / GLOBAL_ID_RADIX) % GLOBAL_ID_RADIX;
         let tid_number = call.global_tid % GLOBAL_ID_RADIX;
         let pid_label = format!("Process {pid_number}");
-        let tid_label = format!("CUDA API Thread {tid_number}");
+        let host_tid = host_slice_tracks[&HostSliceKey::Runtime(call_idx)];
+        let tid_label = format!("CUDA API / NVTX Thread {tid_number}");
         let event_id = call
             .event_id
             .as_ref()
@@ -786,7 +1002,7 @@ fn emit_outputs(
             cat: "cuda_api".into(),
             ts: ts_us,
             dur: Some(dur_us),
-            tid: tid_number,
+            tid: host_tid,
             pid: pid_number,
             args: args.clone(),
             id: None,
@@ -816,7 +1032,7 @@ fn emit_outputs(
     }
 
     for (kernel_idx, kernel) in kernels.iter().enumerate() {
-        let predecessor_id = kernel.predecessor.map(|idx| kernels[idx].event_id.clone());
+        let kernel_source_pid = source_pid(kernel.global_pid);
         let launch_event_id = kernel
             .launch_call
             .and_then(|idx| runtime[idx].event_id.as_ref().cloned());
@@ -830,18 +1046,26 @@ fn emit_outputs(
             "gpuStartNs": kernel.start,
             "gpuEndNs": kernel.end,
             "gpuDurationNs": kernel.end - kernel.start,
-            "dependsOnEventId": predecessor_id,
-            "dependencyType": predecessor_id.as_ref().map(|_| "same_stream_order"),
+            "sourceProcessId": kernel_source_pid,
+            "deviceId": kernel.device,
             "grid": kernel.grid,
             "block": kernel.block,
             "NVTXRegions": kernel.nvtx_regions,
         });
         let ts_us = ns_to_us(kernel.start - origin_ns);
         let dur_us = ns_to_us(kernel.end - kernel.start);
-        let pid_label = format!("CUDA HW Device {}", kernel.device);
+        let pid_label = format!(
+            "CUDA HW PID {} / deviceId {}",
+            kernel_source_pid, kernel.device
+        );
         let tid_label = format!("Context {} / Stream {}", kernel.context, kernel.stream);
-        let gpu_pid = gpu_process_id(kernel.device);
-        let gpu_tid = stream_tracks[&(kernel.device, kernel.context, kernel.stream)];
+        let gpu_pid = gpu_processes[&(kernel_source_pid, kernel.device)];
+        let gpu_tid = stream_tracks[&(
+            kernel_source_pid,
+            kernel.device,
+            kernel.context,
+            kernel.stream,
+        )];
         writer.event(&TraceEvent {
             name: kernel.name.clone(),
             ph: "X".into(),
@@ -872,8 +1096,8 @@ fn emit_outputs(
             stream_id: Some(kernel.stream as u64),
             correlation_id: Some(kernel.correlation as u32),
             stream_sequence: Some(kernel.sequence),
-            depends_on_event_id: predecessor_id.clone(),
-            dependency_type: predecessor_id.as_ref().map(|_| "same_stream_order".into()),
+            depends_on_event_id: None,
+            dependency_type: None,
         });
 
         if let Some(call_idx) = kernel.launch_call {
@@ -883,7 +1107,7 @@ fn emit_outputs(
                 .as_ref()
                 .context("kernel launch call has no event ID")?;
             let call_pid = (call.global_tid / GLOBAL_ID_RADIX) % GLOBAL_ID_RADIX;
-            let call_tid = call.global_tid % GLOBAL_ID_RADIX;
+            let call_tid = host_slice_tracks[&HostSliceKey::Runtime(call_idx)];
             let flow_id = LAUNCH_FLOW_ID_BASE + kernel_idx as u64;
             let flow_args = json!({
                 "from": call_event_id,
@@ -898,7 +1122,7 @@ fn emit_outputs(
                 "launchLatencyUs": ns_to_us((kernel.start - call.end).max(0)),
                 "kernelStartMinusApiEndUs": ns_to_us(kernel.start - call.end),
             });
-            let flow_start_ns = launch_flow_start_ns(call, kernel);
+            let flow_start_ns = flow_start_ns(call, kernel.start);
             writer.event(&TraceEvent {
                 name: "cuda_kernel_launch".into(),
                 ph: "s".into(),
@@ -925,36 +1149,113 @@ fn emit_outputs(
             })?;
             json_event_count += 2;
         }
+    }
 
-        if let Some(previous_idx) = kernel.predecessor {
-            let previous = &kernels[previous_idx];
-            // Keep flow IDs numeric and below 2^53 so JavaScript represents them
-            // exactly. Launch and stream dependencies use disjoint namespaces.
-            let flow_id = STREAM_FLOW_ID_BASE + kernel_idx as u64;
+    for (copy_idx, copy) in memcpys.iter().enumerate() {
+        let copy_source_pid = source_pid(copy.global_pid);
+        let gpu_pid = gpu_processes[&(copy_source_pid, copy.device)];
+        let gpu_tid = stream_tracks[&(copy_source_pid, copy.device, copy.context, copy.stream)];
+        let direction = copy_direction(copy.copy_kind);
+        let duration_ns = copy.end - copy.start;
+        let bandwidth_gbps = if duration_ns > 0 {
+            copy.bytes as f64 / duration_ns as f64
+        } else {
+            0.0
+        };
+        let launch_event_id = copy
+            .launch_call
+            .and_then(|idx| runtime[idx].event_id.as_ref().cloned());
+        let args = json!({
+            "direction": direction, "copyKindId": copy.copy_kind,
+            "bytes": copy.bytes, "durationNs": duration_ns, "bandwidthGBps": bandwidth_gbps,
+            "sourceProcessId": copy_source_pid, "deviceId": copy.device,
+            "contextId": copy.context, "streamId": copy.stream,
+            "correlationId": copy.correlation, "eventId": copy.event_id,
+            "launchEventId": launch_event_id,
+            "srcMemoryKindId": copy.src_kind, "srcMemoryKind": memory_kind(copy.src_kind),
+            "dstMemoryKindId": copy.dst_kind, "dstMemoryKind": memory_kind(copy.dst_kind),
+            "srcDeviceId": copy.src_device, "srcContextId": copy.src_context,
+            "dstDeviceId": copy.dst_device, "dstContextId": copy.dst_context,
+            "graphNodeId": copy.graph_node, "virtualAddress": copy.virtual_address,
+            "copyCount": copy.copy_count, "gpuStartNs": copy.start, "gpuEndNs": copy.end,
+        });
+        let ts_us = ns_to_us(copy.start - origin_ns);
+        let dur_us = ns_to_us(duration_ns);
+        writer.event(&TraceEvent {
+            name: format!("CUDA Memcpy {direction}"),
+            ph: "X".into(),
+            cat: "cuda_memcpy".into(),
+            ts: ts_us,
+            dur: Some(dur_us),
+            tid: gpu_tid,
+            pid: gpu_pid,
+            args: args.clone(),
+            id: None,
+            bp: None,
+        })?;
+        json_event_count += 1;
+        rows.push(TraceRow {
+            report: report.into(),
+            event_type: format!(
+                "cuda_memcpy_{}",
+                direction.to_ascii_lowercase().replace(' ', "_")
+            ),
+            cat: "cuda_memcpy".into(),
+            name: format!("CUDA Memcpy {direction}"),
+            ph: "X".into(),
+            ts_us,
+            dur_us: Some(dur_us),
+            aligned_ts_us: ns_to_us(copy.start - anchor_ns),
+            pid: format!("CUDA HW PID {copy_source_pid} / deviceId {}", copy.device),
+            tid: format!("Context {} / Stream {}", copy.context, copy.stream),
+            args_json: args.to_string(),
+            event_id: Some(copy.event_id.clone()),
+            launch_event_id: launch_event_id.clone(),
+            stream_id: Some(copy.stream as u64),
+            correlation_id: Some(copy.correlation as u32),
+            stream_sequence: None,
+            depends_on_event_id: None,
+            dependency_type: None,
+        });
+        if let Some(call_idx) = copy.launch_call {
+            let call = &runtime[call_idx];
+            let call_event_id = call
+                .event_id
+                .as_ref()
+                .context("memcpy API call has no event ID")?;
+            let call_pid = source_pid(call.global_tid);
+            let call_tid = host_slice_tracks[&HostSliceKey::Runtime(call_idx)];
+            let flow_id = MEMCPY_FLOW_ID_BASE + copy_idx as u64;
             let flow_args = json!({
-                "from": previous.event_id,
-                "to": kernel.event_id,
-                "streamId": kernel.stream,
+                "from": call_event_id, "to": copy.event_id, "direction": direction,
+                "correlationId": copy.correlation, "deviceId": copy.device,
+                "streamId": copy.stream, "bytes": copy.bytes,
+                "cpuCallStartNs": call.start, "cpuCallEndNs": call.end,
+                "gpuCopyStartNs": copy.start, "gpuCopyEndNs": copy.end,
             });
             writer.event(&TraceEvent {
-                name: "same_stream_order".into(),
+                name: format!(
+                    "cuda_memcpy_{}",
+                    direction.to_ascii_lowercase().replace(' ', "_")
+                ),
                 ph: "s".into(),
-                cat: "cuda_dependency".into(),
-                // Flow starts must fall inside the predecessor slice. Chrome/Perfetto
-                // slices are half-open, so binding at exactly `end` drops the flow.
-                ts: ns_to_us((previous.end - 1).max(previous.start) - origin_ns),
+                cat: "cuda_memcpy_dependency".into(),
+                ts: ns_to_us(flow_start_ns(call, copy.start) - origin_ns),
                 dur: None,
-                tid: stream_tracks[&(previous.device, previous.context, previous.stream)],
-                pid: gpu_process_id(previous.device),
+                tid: call_tid,
+                pid: call_pid,
                 args: flow_args.clone(),
                 id: Some(flow_id),
                 bp: None,
             })?;
             writer.event(&TraceEvent {
-                name: "same_stream_order".into(),
+                name: format!(
+                    "cuda_memcpy_{}",
+                    direction.to_ascii_lowercase().replace(' ', "_")
+                ),
                 ph: "f".into(),
-                cat: "cuda_dependency".into(),
-                ts: ns_to_us(kernel.start - origin_ns),
+                cat: "cuda_memcpy_dependency".into(),
+                ts: ns_to_us((copy.start + 1).min(copy.end) - origin_ns),
                 dur: None,
                 tid: gpu_tid,
                 pid: gpu_pid,
@@ -963,27 +1264,12 @@ fn emit_outputs(
                 bp: Some("e".into()),
             })?;
             json_event_count += 2;
-            dependencies.push(DependencyRow {
-                report: report.into(),
-                stream_id: kernel.stream as u64,
-                stream_sequence: kernel.sequence,
-                predecessor_event_id: previous.event_id.clone(),
-                predecessor_kernel: previous.name.clone(),
-                predecessor_ts_us: ns_to_us(previous.start - origin_ns),
-                predecessor_dur_us: ns_to_us(previous.end - previous.start),
-                successor_event_id: kernel.event_id.clone(),
-                successor_kernel: kernel.name.clone(),
-                successor_ts_us: ts_us,
-                successor_dur_us: dur_us,
-                gap_us: ns_to_us((kernel.start - previous.end).max(0)),
-                dependency_type: "same_stream_order".into(),
-            });
         }
     }
 
-    for range in nvtx {
+    for (range_idx, range) in nvtx.iter().enumerate() {
         let pid_label = format!("Process {}", range.pid);
-        let tid_label = format!("NVTX Thread {}", range.tid);
+        let tid_label = format!("CUDA API / NVTX Thread {}", range.tid);
         let ts_us = ns_to_us(range.start - origin_ns);
         let dur_us = ns_to_us(range.end - range.start);
         let args = json!({"sourcePid": range.pid, "sourceTid": range.tid});
@@ -993,7 +1279,7 @@ fn emit_outputs(
             cat: "nvtx".into(),
             ts: ts_us,
             dur: Some(dur_us),
-            tid: range.tid,
+            tid: host_slice_tracks[&HostSliceKey::Nvtx(range_idx)],
             pid: range.pid,
             args: args.clone(),
             id: None,
@@ -1022,9 +1308,10 @@ fn emit_outputs(
         });
 
         for (&device, &(kernel_start, kernel_end)) in &range.kernel_bounds {
-            let projected_pid = format!("CUDA HW Device {device}");
-            let projected_tid = format!("NVTX Kernel Thread {}", range.tid);
-            let projected_track_tid = projected_tracks[&(device, range.pid, range.tid)];
+            // Put the GPU-projected NVTX interval on the same source CPU thread
+            // as CUDA API and NVTX events. Hardware execution remains on streams.
+            let projected_pid = format!("Process {}", range.pid);
+            let projected_tid = format!("CUDA API / NVTX Thread {}", range.tid);
             let projected_ts_us = ns_to_us(kernel_start - origin_ns);
             let projected_dur_us = ns_to_us(kernel_end - kernel_start);
             writer.event(&TraceEvent {
@@ -1033,8 +1320,8 @@ fn emit_outputs(
                 cat: "nvtx-kernel".into(),
                 ts: projected_ts_us,
                 dur: Some(projected_dur_us),
-                tid: projected_track_tid,
-                pid: gpu_process_id(device),
+                tid: host_slice_tracks[&HostSliceKey::ProjectedNvtx(range_idx, device)],
+                pid: range.pid,
                 args: json!({"sourcePid": range.pid, "sourceTid": range.tid, "deviceId": device}),
                 id: None,
                 bp: None,
@@ -1276,21 +1563,31 @@ async fn write_parquet(ctx: &SessionContext, batch: RecordBatch, path: &Path) ->
 async fn main() -> Result<()> {
     let args = Args::parse();
     let ctx = SessionContext::new();
-    register_tables(&ctx, &args.parquet_dir).await?;
+    let has_memcpy = register_tables(&ctx, &args.parquet_dir).await?;
 
     let (kernels_result, nvtx_result, runtime_result) =
         tokio::join!(load_kernels(&ctx), load_nvtx(&ctx), load_runtime(&ctx),);
     let mut kernels = kernels_result?;
     let mut nvtx = nvtx_result?;
     let mut runtime = runtime_result?;
-    let launch_dependencies =
-        link_runtime_calls_to_kernels(&args.report, &mut kernels, &mut runtime);
+    let mut memcpys = if has_memcpy {
+        load_memcpys(&ctx).await?
+    } else {
+        Vec::new()
+    };
+    let (launch_dependencies, memcpy_launch_dependencies) = link_runtime_calls_to_gpu_activities(
+        &args.report,
+        &mut kernels,
+        &mut memcpys,
+        &mut runtime,
+    );
     project_nvtx_to_kernels(&mut kernels, &mut nvtx, &runtime);
-    assign_stream_dependencies(&args.report, &mut kernels);
+    assign_kernel_ids(&args.report, &mut kernels);
 
     let origin_ns = kernels
         .iter()
         .map(|k| k.start)
+        .chain(memcpys.iter().map(|copy| copy.start))
         .chain(nvtx.iter().map(|n| n.start))
         .chain(
             runtime
@@ -1322,6 +1619,7 @@ async fn main() -> Result<()> {
         &args.report,
         &args.output_json,
         &kernels,
+        &memcpys,
         &runtime,
         &nvtx,
         origin_ns,
@@ -1333,6 +1631,18 @@ async fn main() -> Result<()> {
         .filter(|call| call.event_id.is_some())
         .count();
     let dependency_count = dependencies.len();
+    let h2d_count = memcpys
+        .iter()
+        .filter(|copy| matches!(copy.copy_kind, 1 | 11))
+        .count();
+    let d2h_count = memcpys
+        .iter()
+        .filter(|copy| matches!(copy.copy_kind, 2 | 12))
+        .count();
+    let d2d_count = memcpys
+        .iter()
+        .filter(|copy| matches!(copy.copy_kind, 3 | 8 | 13))
+        .count();
     write_parquet(&ctx, trace_rows_batch(trace_rows)?, &args.output_parquet).await?;
     write_parquet(
         &ctx,
@@ -1342,11 +1652,16 @@ async fn main() -> Result<()> {
     .await?;
 
     println!(
-        "report={} kernels={} cuda_api={} launch_dependencies={} nvtx={} nvtx_kernel={} stream_dependencies={} json_events={} parquet_rows={} anchor_ns={} alignment_anchor={}",
+        "report={} kernels={} cuda_api={} launch_dependencies={} memcpy={} h2d={} d2h={} d2d={} memcpy_launch_dependencies={} nvtx={} nvtx_kernel={} stream_dependencies={} json_events={} parquet_rows={} anchor_ns={} alignment_anchor={}",
         args.report,
         kernels.len(),
         cuda_api_count,
         launch_dependencies,
+        memcpys.len(),
+        h2d_count,
+        d2h_count,
+        d2d_count,
+        memcpy_launch_dependencies,
         nvtx.len(),
         projected_nvtx,
         dependency_count,

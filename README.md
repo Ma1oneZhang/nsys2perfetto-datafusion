@@ -1,20 +1,21 @@
 # nsys2perfetto-datafusion
 
 Convert native NVIDIA Nsight Systems Parquet exports into a Perfetto-compatible
-timeline, an aligned event table, and an explicit CUDA stream dependency table.
+timeline and an aligned event table.
 The converter reads Parquet with Apache DataFusion and does not use SQLite.
 
 ## Features
 
 - CUDA kernel slices with device, context, stream, correlation, grid, and block metadata
 - CPU CUDA Runtime launch slices linked to GPU kernel execution with Perfetto flows
-- Explicit `CUDA HW Device` process tracks with context/stream lanes showing
+- H2D, D2H, and D2D memcpy slices with byte count, memory kinds, bandwidth,
+  source/destination device/context details, and API-to-copy flows
+- Explicit per-source-process `CUDA HW deviceId` tracks with context/stream lanes showing
   the CUPTI kernel start, end, and duration
 - NVTX push/pop ranges and NVTX-to-kernel projection using CUDA Runtime overlap
-- Multi-GPU processes, with projected NVTX tracks separated by CUDA device
-- Numeric Perfetto flow events between consecutive kernels on each CUDA stream
+- CUDA API, CPU NVTX, and GPU-projected NVTX slices merged onto their source CPU thread
+- Process-aware multi-GPU tracks so process-local device IDs cannot be conflated
 - Aligned event Parquet for DuckDB/DataFusion queries
-- A separate dependency Parquet with predecessor/successor kernel IDs and stream gaps
 
 ## Input
 
@@ -54,8 +55,9 @@ dependency arrows are accepted by Perfetto.
 
 Every matched kernel launch emits a `cuda_launch_dependency` flow from the CPU
 CUDA Runtime API slice to the corresponding GPU kernel. Matching uses the
-Nsight `(PID, correlationId)` relationship. Same-stream kernel ordering remains
-available separately as `cuda_dependency` flows.
+Nsight `(PID, correlationId)` relationship. Memcpy API calls use the same
+relationship to link to H2D, D2H, and D2D hardware intervals. Consecutive
+kernels on a stream are intentionally not connected.
 
 The Chrome JSON uses numeric process and thread IDs plus `process_name`,
 `thread_name`, and sort-index metadata. As a result, CUDA hardware execution
@@ -63,13 +65,8 @@ tracks are grouped and displayed before host launch tracks in Perfetto. Select
 either a host launch slice or a GPU kernel slice to display their connecting
 flow arrow.
 
-## Stream dependencies
-
-Dependencies are ordering edges between consecutive kernels on the same CUDA
-stream. Each kernel event includes its stream ID and sequence number. The event
-Parquet contains `depends_on_event_id`, while the dependency Parquet records the
-predecessor and successor event IDs, kernel names, timestamps, durations, and
-the inter-kernel gap.
+The dependency Parquet argument remains for CLI compatibility and produces an
+empty, schema-valid table; only observed API-to-GPU correlation flows are shown.
 
 ## Requirements
 
