@@ -13,7 +13,8 @@ The converter reads Parquet with Apache DataFusion and does not use SQLite.
 - Explicit per-source-process `CUDA HW deviceId` tracks with context/stream lanes showing
   the CUPTI kernel start, end, and duration
 - NVTX push/pop ranges and NVTX-to-kernel projection using CUDA Runtime overlap
-- CUDA API, CPU NVTX, and GPU-projected NVTX slices merged onto their source CPU thread
+- CUDA API, CPU NVTX, and GPU-projected NVTX slices grouped into adjacent,
+  overlap-safe lanes for each source CPU thread
 - Process-aware multi-GPU tracks so process-local device IDs cannot be conflated
 - Aligned event Parquet for DuckDB/DataFusion queries
 
