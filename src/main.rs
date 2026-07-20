@@ -36,6 +36,14 @@ struct Args {
     output_dependencies: PathBuf,
 }
 
+struct TableAvailability {
+    kernels: bool,
+    runtime: bool,
+    memcpy: bool,
+    nvtx: bool,
+    strings: bool,
+}
+
 #[derive(Debug)]
 struct Kernel {
     start: i64,
@@ -218,20 +226,25 @@ fn string_at(batch: &RecordBatch, name: &str, row: usize) -> Result<String> {
     bail!("column {name} is neither Utf8 nor Utf8View")
 }
 
-async fn register_tables(ctx: &SessionContext, dir: &Path) -> Result<bool> {
+async fn register_tables(ctx: &SessionContext, dir: &Path) -> Result<TableAvailability> {
     let tables = [
         ("kernels", "CUPTI_ACTIVITY_KIND_KERNEL.parquet"),
         ("runtime", "CUPTI_ACTIVITY_KIND_RUNTIME.parquet"),
-        ("nvtx", "NVTX_EVENTS.parquet"),
         ("strings", "StringIds.parquet"),
+        ("memcpy", "CUPTI_ACTIVITY_KIND_MEMCPY.parquet"),
+        ("nvtx", "NVTX_EVENTS.parquet"),
     ];
+    let mut availability = TableAvailability {
+        kernels: false,
+        runtime: false,
+        memcpy: false,
+        nvtx: false,
+        strings: false,
+    };
     for (name, file) in tables {
         let path = dir.join(file);
         if !path.is_file() {
-            bail!(
-                "required Nsight Parquet table is missing: {}",
-                path.display()
-            );
+            continue;
         }
         ctx.register_parquet(
             name,
@@ -239,19 +252,23 @@ async fn register_tables(ctx: &SessionContext, dir: &Path) -> Result<bool> {
             ParquetReadOptions::default(),
         )
         .await?;
+        match name {
+            "kernels" => availability.kernels = true,
+            "runtime" => availability.runtime = true,
+            "strings" => availability.strings = true,
+            "memcpy" => availability.memcpy = true,
+            "nvtx" => availability.nvtx = true,
+            _ => unreachable!(),
+        }
     }
-    let memcpy_path = dir.join("CUPTI_ACTIVITY_KIND_MEMCPY.parquet");
-    if memcpy_path.is_file() {
-        ctx.register_parquet(
-            "memcpy",
-            memcpy_path.to_str().context("non-UTF8 Parquet path")?,
-            ParquetReadOptions::default(),
-        )
-        .await?;
-        Ok(true)
-    } else {
-        Ok(false)
+    if !availability.strings {
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("id", DataType::Int64, false),
+            Field::new("value", DataType::Utf8, true),
+        ]));
+        ctx.register_batch("strings", RecordBatch::new_empty(schema))?;
     }
+    Ok(availability)
 }
 
 async fn load_kernels(ctx: &SessionContext) -> Result<Vec<Kernel>> {
@@ -804,7 +821,7 @@ fn emit_outputs(
 
     // A CUDA device ID is process-local. Keep the source process in every GPU
     // track key so two processes' device 0 never collapse onto one device.
-    let gpu_keys: BTreeSet<(i64, i64)> = kernels
+    let mut gpu_keys: BTreeSet<(i64, i64)> = kernels
         .iter()
         .map(|kernel| (source_pid(kernel.global_pid), kernel.device))
         .chain(
@@ -813,6 +830,17 @@ fn emit_outputs(
                 .map(|copy| (source_pid(copy.global_pid), copy.device)),
         )
         .collect();
+    let known_pids: BTreeSet<i64> = gpu_keys.iter().map(|&(pid, _)| pid).collect();
+    for pid in runtime
+        .iter()
+        .filter(|call| call.event_id.is_some())
+        .map(|call| source_pid(call.global_tid))
+        .chain(nvtx.iter().map(|range| range.pid))
+    {
+        if !known_pids.contains(&pid) {
+            gpu_keys.insert((pid, -1));
+        }
+    }
     let gpu_processes: BTreeMap<(i64, i64), i64> = gpu_keys
         .iter()
         .enumerate()
@@ -857,6 +885,11 @@ fn emit_outputs(
                 .entry(call_idx)
                 .or_default()
                 .insert(copy.device);
+        }
+    }
+    for (call_idx, call) in runtime.iter().enumerate() {
+        if call.event_id.is_some() && !call_devices.contains_key(&call_idx) {
+            call_devices.entry(call_idx).or_default().insert(-1);
         }
     }
     let process_devices: BTreeMap<i64, BTreeSet<i64>> =
@@ -1763,14 +1796,32 @@ async fn write_parquet(ctx: &SessionContext, batch: RecordBatch, path: &Path) ->
 async fn main() -> Result<()> {
     let args = Args::parse();
     let ctx = SessionContext::new();
-    let has_memcpy = register_tables(&ctx, &args.parquet_dir).await?;
+    let tables = register_tables(&ctx, &args.parquet_dir).await?;
+    if !tables.strings {
+        eprintln!("warning: StringIds.parquet is absent; using numeric fallback event names");
+    }
 
-    let (kernels_result, nvtx_result, runtime_result) =
-        tokio::join!(load_kernels(&ctx), load_nvtx(&ctx), load_runtime(&ctx),);
-    let mut kernels = kernels_result?;
-    let mut nvtx = nvtx_result?;
-    let mut runtime = runtime_result?;
-    let mut memcpys = if has_memcpy {
+    let mut kernels = if tables.kernels {
+        load_kernels(&ctx).await?
+    } else {
+        eprintln!("warning: CUPTI_ACTIVITY_KIND_KERNEL.parquet is absent");
+        Vec::new()
+    };
+    let mut nvtx = if tables.nvtx {
+        load_nvtx(&ctx).await?
+    } else {
+        eprintln!("warning: NVTX_EVENTS.parquet is absent; exporting CUDA timelines without NVTX");
+        Vec::new()
+    };
+    let mut runtime = if tables.runtime {
+        load_runtime(&ctx).await?
+    } else {
+        eprintln!(
+            "warning: CUPTI_ACTIVITY_KIND_RUNTIME.parquet is absent; API flows are unavailable"
+        );
+        Vec::new()
+    };
+    let mut memcpys = if tables.memcpy {
         load_memcpys(&ctx).await?
     } else {
         Vec::new()
@@ -1781,6 +1832,16 @@ async fn main() -> Result<()> {
         &mut memcpys,
         &mut runtime,
     );
+    if kernels.is_empty() && memcpys.is_empty() {
+        for (call_idx, call) in runtime.iter_mut().enumerate() {
+            let pid = source_pid(call.global_tid);
+            let tid = call.global_tid % GLOBAL_ID_RADIX;
+            call.event_id = Some(format!(
+                "{}:cuda_api_unlinked:{pid}:{tid}:{}:{call_idx}",
+                args.report, call.correlation
+            ));
+        }
+    }
     project_nvtx_to_kernels(&mut kernels, &mut nvtx, &runtime);
     assign_kernel_ids(&args.report, &mut kernels);
 
@@ -1796,7 +1857,7 @@ async fn main() -> Result<()> {
                 .map(|call| call.start),
         )
         .min()
-        .context("trace contains no kernel or NVTX ranges")?;
+        .context("trace contains no CUDA kernel, memcpy, linked API, or NVTX ranges")?;
     let measured_batch_anchor = nvtx
         .iter()
         .filter(|n| {

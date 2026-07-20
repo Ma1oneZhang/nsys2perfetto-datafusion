@@ -37,7 +37,10 @@ nsys export \
 ```
 
 The Parquet directory must include the native Nsight string, CUDA kernel, CUDA
-Runtime, and NVTX tables used by the trace.
+Runtime, memcpy, or NVTX tables used by the trace. Timeline tables are optional
+independently: missing categories are skipped, and a missing `StringIds` table
+uses stable numeric fallback names. Conversion fails only when no available
+table can produce a timeline event.
 
 `aligned_ts_us` uses the first `CriticalPath/MeasuredBatch/.../batch_0` NVTX
 range when present, and otherwise falls back to the first trace event.
