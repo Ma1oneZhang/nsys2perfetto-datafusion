@@ -10,6 +10,17 @@ The converter reads Parquet with Apache DataFusion and does not use SQLite.
 - CPU CUDA Runtime launch slices linked to GPU kernel execution with Perfetto flows
 - H2D, D2H, and D2D memcpy slices with byte count, memory kinds, bandwidth,
   source/destination device/context details, and API-to-copy flows
+- Memcpy remains visible on its CUDA HW context/stream and is also projected to
+  one per-device `PCIe Usage` lane for combined H2D/D2H occupancy; D2D uses a
+  separate `GPU Copy D2D` lane
+- Every kernel remains visible on its CUDA HW context/stream and is also
+  projected once to an overlap-safe per-device `CUDA Core Timeline`; copy
+  activity is never included on this kernel-only timeline
+- Every matched CUDA launch has independent API flow arrows to both its
+  original stream kernel and its `CUDA Core Timeline` projection
+- Every matched H2D/D2H API has independent flow arrows to both its original
+  stream memcpy and every corresponding per-device `PCIe Usage` projection;
+  D2D remains excluded from PCIe flows
 - Explicit per-source-process `CUDA HW deviceId` tracks with context/stream lanes showing
   the CUPTI kernel start, end, and duration
 - NVTX push/pop ranges and NVTX-to-kernel projection using CUDA Runtime overlap
@@ -21,6 +32,11 @@ The converter reads Parquet with Apache DataFusion and does not use SQLite.
 - Tracks with the same source thread ID grouped as NVTX Kernel, NVTX Thread,
   then CUDA API
 - Process-aware multi-GPU tracks so process-local device IDs cannot be conflated
+- Dynamic device discovery with no fixed GPU-count limit; GPU-less NVTX/runtime
+  processes inherit all devices observed in the trace instead of becoming
+  `Device -1`
+- Streaming gzip output when `--output-json` ends in `.gz`
+- An eight-worker Tokio multi-thread runtime for Parquet parsing and conversion
 - Aligned event Parquet for DuckDB/DataFusion queries
 
 ## Input
@@ -53,12 +69,14 @@ Clone this repository and call the binary through Cargo:
 cargo run --locked --release -- \
   --parquet-dir /tmp/report-parquet \
   --report report \
-  --output-json /tmp/report.perfetto.json \
+  --output-json /tmp/report.perfetto.json.gz \
   --output-parquet /tmp/report.perfetto.parquet \
   --output-dependencies /tmp/report.kernel_dependencies.parquet
 ```
 
-Open the JSON at [ui.perfetto.dev](https://ui.perfetto.dev/). The JSON uses
+Open the JSON or JSON gzip directly at [ui.perfetto.dev](https://ui.perfetto.dev/).
+The `.json.gz` is a single compressed JSON stream, not an archive, and contains
+no Parquet output. The JSON uses
 Chrome Trace Event format and emits `s`/`f` flow pairs with numeric IDs so the
 dependency arrows are accepted by Perfetto.
 
@@ -81,6 +99,15 @@ empty, schema-valid table; only observed API-to-GPU correlation flows are shown.
 
 - Rust/Cargo 1.88 or newer
 - Native Parquet output from NVIDIA Nsight Systems
+
+## Code organization
+
+- `main.rs`: CLI orchestration, shared data models, and conversion summary
+- `input.rs`: DataFusion table registration and native Nsight Parquet loading
+- `analysis.rs`: CUDA API/activity linking, NVTX projection, device assignment,
+  lane allocation, and unit tests
+- `perfetto.rs`: track planning plus Chrome Trace JSON events and flows
+- `parquet_output.rs`: Arrow schemas and aligned Parquet writers
 
 ## License
 

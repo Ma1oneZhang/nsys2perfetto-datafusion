@@ -1918,11 +1918,12 @@ dependencies = [
 
 [[package]]
 name = "nsys2perfetto-datafusion"
-version = "0.1.9"
+version = "0.2.0"
 dependencies = [
  "anyhow",
  "clap",
  "datafusion",
+ "flate2",
  "serde",
  "serde_json",
  "tokio",
