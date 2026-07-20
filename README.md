@@ -18,6 +18,8 @@ The converter reads Parquet with Apache DataFusion and does not use SQLite.
 - NVTX and projected NVTX emitted as timestamp-sorted begin/end stacks so
   Perfetto preserves their push/pop parent-child hierarchy
 - Overlap-safe CUDA API lanes so Perfetto drops no complete-event slices
+- Tracks with the same source thread ID grouped as NVTX Kernel, NVTX Thread,
+  then CUDA API
 - Process-aware multi-GPU tracks so process-local device IDs cannot be conflated
 - Aligned event Parquet for DuckDB/DataFusion queries
 

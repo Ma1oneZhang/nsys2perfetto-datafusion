@@ -1048,12 +1048,36 @@ fn emit_outputs(
             json_event_count += 1;
         }
     }
+    let source_thread_keys: BTreeSet<(i64, i64, i64)> = device_track_metadata
+        .iter()
+        .map(|&(pid, device, _, _, source_tid, _)| (pid, device, source_tid))
+        .collect();
+    let mut source_thread_ranks = BTreeMap::new();
+    let mut previous_device = None;
+    let mut rank = 0_i64;
+    for &(pid, device, source_tid) in &source_thread_keys {
+        if previous_device != Some((pid, device)) {
+            previous_device = Some((pid, device));
+            rank = 0;
+        }
+        source_thread_ranks.insert((pid, device, source_tid), rank);
+        rank += 1;
+    }
+
     for (source_pid, device, kind, tid, source_tid, lane) in device_track_metadata {
         let track_kind = match kind {
             DeviceTrackKind::ProjectedNvtx => "NVTX Kernel",
             DeviceTrackKind::Runtime => "CUDA API",
             DeviceTrackKind::Nvtx => "NVTX Thread",
         };
+        let kind_order = match kind {
+            DeviceTrackKind::ProjectedNvtx => 0_i64,
+            DeviceTrackKind::Nvtx => 1_i64,
+            DeviceTrackKind::Runtime => 2_i64,
+        };
+        let lane_order = lane.unwrap_or(0) as i64;
+        let thread_rank = source_thread_ranks[&(source_pid, device, source_tid)];
+        let sort_index = 1_000_000 + thread_rank * 100 + kind_order * 20 + lane_order;
         let track_name = match lane {
             Some(lane) => format!("{track_kind} {source_tid} / Lane {}", lane + 1),
             None => format!("{track_kind} {source_tid}"),
@@ -1079,7 +1103,7 @@ fn emit_outputs(
             dur: None,
             tid,
             pid: gpu_processes[&(source_pid, device)],
-            args: json!({"sort_index": tid}),
+            args: json!({"sort_index": sort_index}),
             id: None,
             bp: None,
         })?;
