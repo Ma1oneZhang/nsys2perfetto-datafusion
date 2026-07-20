@@ -48,6 +48,7 @@ struct Kernel {
     sequence: u64,
     event_id: String,
     predecessor: Option<usize>,
+    launch_call: Option<usize>,
     nvtx_regions: Vec<String>,
 }
 
@@ -57,6 +58,8 @@ struct RuntimeCall {
     end: i64,
     global_tid: i64,
     correlation: i64,
+    name: String,
+    event_id: Option<String>,
 }
 
 #[derive(Debug)]
@@ -99,6 +102,7 @@ struct TraceRow {
     tid: String,
     args_json: String,
     event_id: Option<String>,
+    launch_event_id: Option<String>,
     stream_id: Option<u64>,
     correlation_id: Option<u32>,
     stream_sequence: Option<u64>,
@@ -265,6 +269,7 @@ async fn load_kernels(ctx: &SessionContext) -> Result<Vec<Kernel>> {
                 sequence: 0,
                 event_id: String::new(),
                 predecessor: None,
+                launch_call: None,
                 nvtx_regions: Vec::new(),
             });
         }
@@ -309,11 +314,13 @@ async fn load_nvtx(ctx: &SessionContext) -> Result<Vec<NvtxRange>> {
 async fn load_runtime(ctx: &SessionContext) -> Result<Vec<RuntimeCall>> {
     let sql = r#"
         SELECT
-            CAST(start AS BIGINT) AS start_ns,
-            CAST("end" AS BIGINT) AS end_ns,
-            CAST("globalTid" AS BIGINT) AS global_tid,
-            CAST("correlationId" AS BIGINT) AS correlation_id
-        FROM runtime
+            CAST(r.start AS BIGINT) AS start_ns,
+            CAST(r."end" AS BIGINT) AS end_ns,
+            CAST(r."globalTid" AS BIGINT) AS global_tid,
+            CAST(r."correlationId" AS BIGINT) AS correlation_id,
+            COALESCE(s.value, CONCAT('cuda_api_', CAST(r."nameId" AS VARCHAR))) AS runtime_name
+        FROM runtime r
+        LEFT JOIN strings s ON CAST(r."nameId" AS BIGINT) = CAST(s.id AS BIGINT)
         ORDER BY start_ns, end_ns, correlation_id
     "#;
     let batches = ctx.sql(sql).await?.collect().await?;
@@ -329,6 +336,8 @@ async fn load_runtime(ctx: &SessionContext) -> Result<Vec<RuntimeCall>> {
                 end: end.value(row),
                 global_tid: global_tid.value(row),
                 correlation: correlation.value(row),
+                name: string_at(&batch, "runtime_name", row)?,
+                event_id: None,
             });
         }
     }
@@ -341,6 +350,47 @@ enum BoundaryKind {
     NvtxEnd,
     ApiStart,
     NvtxStart,
+}
+
+fn link_runtime_calls_to_kernels(
+    report: &str,
+    kernels: &mut [Kernel],
+    runtime: &mut [RuntimeCall],
+) -> usize {
+    let mut calls_by_process_correlation: HashMap<(i64, i64), Vec<usize>> = HashMap::new();
+    for (idx, call) in runtime.iter().enumerate() {
+        let pid = (call.global_tid / GLOBAL_ID_RADIX) % GLOBAL_ID_RADIX;
+        calls_by_process_correlation
+            .entry((pid, call.correlation))
+            .or_default()
+            .push(idx);
+    }
+
+    let mut links = 0;
+    for kernel in kernels {
+        let pid = (kernel.global_pid / GLOBAL_ID_RADIX) % GLOBAL_ID_RADIX;
+        let Some(candidates) = calls_by_process_correlation.get(&(pid, kernel.correlation)) else {
+            continue;
+        };
+        let Some(&call_idx) = candidates.iter().min_by_key(|&&idx| {
+            let call = &runtime[idx];
+            (call.start > kernel.start, call.start.abs_diff(kernel.start))
+        }) else {
+            continue;
+        };
+
+        if runtime[call_idx].event_id.is_none() {
+            let call = &runtime[call_idx];
+            let tid = call.global_tid % GLOBAL_ID_RADIX;
+            runtime[call_idx].event_id = Some(format!(
+                "{report}:cuda_api:{pid}:{tid}:{}:{call_idx}",
+                call.correlation
+            ));
+        }
+        kernel.launch_call = Some(call_idx);
+        links += 1;
+    }
+    links
 }
 
 fn project_nvtx_to_kernels(
@@ -462,6 +512,7 @@ mod tests {
             sequence: 0,
             event_id: String::new(),
             predecessor: None,
+            launch_call: None,
             nvtx_regions: Vec::new(),
         }
     }
@@ -479,12 +530,14 @@ mod tests {
             tid,
             kernel_bounds: BTreeMap::new(),
         }];
-        let runtime = vec![
+        let mut runtime = vec![
             RuntimeCall {
                 start: 10,
                 end: 12,
                 global_tid: pid * GLOBAL_ID_RADIX + tid,
                 correlation: 10,
+                name: "cudaLaunchKernel".into(),
+                event_id: None,
             },
             RuntimeCall {
                 start: 20,
@@ -493,11 +546,20 @@ mod tests {
                 // device, so an API call on another thread is still projected.
                 global_tid: pid * GLOBAL_ID_RADIX + tid + 1,
                 correlation: 11,
+                name: "cudaLaunchKernel".into(),
+                event_id: None,
             },
         ];
 
+        assert_eq!(
+            link_runtime_calls_to_kernels("report", &mut kernels, &mut runtime),
+            2
+        );
         project_nvtx_to_kernels(&mut kernels, &mut nvtx, &runtime);
 
+        assert_eq!(kernels[0].launch_call, Some(0));
+        assert_eq!(kernels[1].launch_call, Some(1));
+        assert!(runtime.iter().all(|call| call.event_id.is_some()));
         assert_eq!(nvtx[0].kernel_bounds.get(&0), Some(&(15, 20)));
         assert_eq!(nvtx[0].kernel_bounds.get(&1), Some(&(25, 30)));
         assert_eq!(kernels[0].nvtx_regions, ["multi_gpu_range"]);
@@ -533,23 +595,78 @@ fn emit_outputs(
     report: &str,
     output_json: &Path,
     kernels: &[Kernel],
+    runtime: &[RuntimeCall],
     nvtx: &[NvtxRange],
     origin_ns: i64,
     anchor_ns: i64,
 ) -> Result<(Vec<TraceRow>, Vec<DependencyRow>, usize)> {
     let mut writer = JsonArrayWriter::create(output_json)?;
-    let mut rows = Vec::with_capacity(kernels.len() + nvtx.len() * 2);
+    let mut rows = Vec::with_capacity(kernels.len() * 2 + nvtx.len() * 2);
     let mut dependencies = Vec::with_capacity(kernels.len());
     let mut json_event_count = 0usize;
 
-    for kernel in kernels {
+    for call in runtime.iter().filter(|call| call.event_id.is_some()) {
+        let pid_number = (call.global_tid / GLOBAL_ID_RADIX) % GLOBAL_ID_RADIX;
+        let tid_number = call.global_tid % GLOBAL_ID_RADIX;
+        let pid = format!("Process {pid_number}");
+        let tid = format!("CUDA API Thread {tid_number}");
+        let event_id = call
+            .event_id
+            .as_ref()
+            .context("linked CUDA API has no event ID")?;
+        let ts_us = ns_to_us(call.start - origin_ns);
+        let dur_us = ns_to_us(call.end - call.start);
+        let args = json!({
+            "correlationId": call.correlation,
+            "eventId": event_id,
+        });
+        writer.event(&TraceEvent {
+            name: call.name.clone(),
+            ph: "X".into(),
+            cat: "cuda_api".into(),
+            ts: ts_us,
+            dur: Some(dur_us),
+            tid: tid.clone(),
+            pid: pid.clone(),
+            args: args.clone(),
+            id: None,
+            bp: None,
+        })?;
+        json_event_count += 1;
+        rows.push(TraceRow {
+            report: report.into(),
+            event_type: "cuda_api".into(),
+            cat: "cuda_api".into(),
+            name: call.name.clone(),
+            ph: "X".into(),
+            ts_us,
+            dur_us: Some(dur_us),
+            aligned_ts_us: ns_to_us(call.start - anchor_ns),
+            pid,
+            tid,
+            args_json: args.to_string(),
+            event_id: Some(event_id.clone()),
+            launch_event_id: None,
+            stream_id: None,
+            correlation_id: Some(call.correlation as u32),
+            stream_sequence: None,
+            depends_on_event_id: None,
+            dependency_type: None,
+        });
+    }
+
+    for (kernel_idx, kernel) in kernels.iter().enumerate() {
         let predecessor_id = kernel.predecessor.map(|idx| kernels[idx].event_id.clone());
+        let launch_event_id = kernel
+            .launch_call
+            .and_then(|idx| runtime[idx].event_id.as_ref().cloned());
         let args = json!({
             "correlationId": kernel.correlation,
             "contextId": kernel.context,
             "streamId": kernel.stream,
             "streamSequence": kernel.sequence,
             "eventId": kernel.event_id,
+            "launchEventId": launch_event_id,
             "dependsOnEventId": predecessor_id,
             "dependencyType": predecessor_id.as_ref().map(|_| "same_stream_order"),
             "grid": kernel.grid,
@@ -586,12 +703,56 @@ fn emit_outputs(
             tid: tid.clone(),
             args_json: args.to_string(),
             event_id: Some(kernel.event_id.clone()),
+            launch_event_id: launch_event_id.clone(),
             stream_id: Some(kernel.stream as u64),
             correlation_id: Some(kernel.correlation as u32),
             stream_sequence: Some(kernel.sequence),
             depends_on_event_id: predecessor_id.clone(),
             dependency_type: predecessor_id.as_ref().map(|_| "same_stream_order".into()),
         });
+
+        if let Some(call_idx) = kernel.launch_call {
+            let call = &runtime[call_idx];
+            let call_event_id = call
+                .event_id
+                .as_ref()
+                .context("kernel launch call has no event ID")?;
+            let call_pid = (call.global_tid / GLOBAL_ID_RADIX) % GLOBAL_ID_RADIX;
+            let call_tid = call.global_tid % GLOBAL_ID_RADIX;
+            let flow_id = (1_u64 << 52) | kernel_idx as u64;
+            let flow_args = json!({
+                "from": call_event_id,
+                "to": kernel.event_id,
+                "correlationId": kernel.correlation,
+                "deviceId": kernel.device,
+                "streamId": kernel.stream,
+            });
+            writer.event(&TraceEvent {
+                name: "cuda_kernel_launch".into(),
+                ph: "s".into(),
+                cat: "cuda_launch_dependency".into(),
+                ts: ns_to_us((call.end - 1).max(call.start) - origin_ns),
+                dur: None,
+                tid: format!("CUDA API Thread {call_tid}"),
+                pid: format!("Process {call_pid}"),
+                args: flow_args.clone(),
+                id: Some(flow_id),
+                bp: None,
+            })?;
+            writer.event(&TraceEvent {
+                name: "cuda_kernel_launch".into(),
+                ph: "f".into(),
+                cat: "cuda_launch_dependency".into(),
+                ts: ns_to_us(kernel.start - origin_ns),
+                dur: None,
+                tid: tid.clone(),
+                pid: pid.clone(),
+                args: flow_args,
+                id: Some(flow_id),
+                bp: Some("e".into()),
+            })?;
+            json_event_count += 2;
+        }
 
         if let Some(previous_idx) = kernel.predecessor {
             let previous = &kernels[previous_idx];
@@ -682,6 +843,7 @@ fn emit_outputs(
             tid,
             args_json: args.to_string(),
             event_id: None,
+            launch_event_id: None,
             stream_id: None,
             correlation_id: None,
             stream_sequence: None,
@@ -722,6 +884,7 @@ fn emit_outputs(
                     json!({"sourcePid": range.pid, "sourceTid": range.tid, "deviceId": device})
                         .to_string(),
                 event_id: None,
+                launch_event_id: None,
                 stream_id: None,
                 correlation_id: None,
                 stream_sequence: None,
@@ -748,6 +911,7 @@ fn trace_rows_batch(rows: Vec<TraceRow>) -> Result<RecordBatch> {
         Field::new("tid", DataType::Utf8, false),
         Field::new("args_json", DataType::Utf8, false),
         Field::new("event_id", DataType::Utf8, true),
+        Field::new("launch_event_id", DataType::Utf8, true),
         Field::new("stream_id", DataType::UInt64, true),
         Field::new("correlation_id", DataType::UInt32, true),
         Field::new("stream_sequence", DataType::UInt64, true),
@@ -809,6 +973,11 @@ fn trace_rows_batch(rows: Vec<TraceRow>) -> Result<RecordBatch> {
             Arc::new(StringArray::from(
                 rows.iter()
                     .map(|r| r.event_id.as_deref())
+                    .collect::<Vec<_>>(),
+            )),
+            Arc::new(StringArray::from(
+                rows.iter()
+                    .map(|r| r.launch_event_id.as_deref())
                     .collect::<Vec<_>>(),
             )),
             Arc::new(UInt64Array::from(
@@ -942,7 +1111,9 @@ async fn main() -> Result<()> {
         tokio::join!(load_kernels(&ctx), load_nvtx(&ctx), load_runtime(&ctx),);
     let mut kernels = kernels_result?;
     let mut nvtx = nvtx_result?;
-    let runtime = runtime_result?;
+    let mut runtime = runtime_result?;
+    let launch_dependencies =
+        link_runtime_calls_to_kernels(&args.report, &mut kernels, &mut runtime);
     project_nvtx_to_kernels(&mut kernels, &mut nvtx, &runtime);
     assign_stream_dependencies(&args.report, &mut kernels);
 
@@ -950,6 +1121,12 @@ async fn main() -> Result<()> {
         .iter()
         .map(|k| k.start)
         .chain(nvtx.iter().map(|n| n.start))
+        .chain(
+            runtime
+                .iter()
+                .filter(|call| call.event_id.is_some())
+                .map(|call| call.start),
+        )
         .min()
         .context("trace contains no kernel or NVTX ranges")?;
     let measured_batch_anchor = nvtx
@@ -974,11 +1151,16 @@ async fn main() -> Result<()> {
         &args.report,
         &args.output_json,
         &kernels,
+        &runtime,
         &nvtx,
         origin_ns,
         anchor_ns,
     )?;
     let trace_row_count = trace_rows.len();
+    let cuda_api_count = runtime
+        .iter()
+        .filter(|call| call.event_id.is_some())
+        .count();
     let dependency_count = dependencies.len();
     write_parquet(&ctx, trace_rows_batch(trace_rows)?, &args.output_parquet).await?;
     write_parquet(
@@ -989,9 +1171,11 @@ async fn main() -> Result<()> {
     .await?;
 
     println!(
-        "report={} kernels={} nvtx={} nvtx_kernel={} dependencies={} json_events={} parquet_rows={} anchor_ns={} alignment_anchor={}",
+        "report={} kernels={} cuda_api={} launch_dependencies={} nvtx={} nvtx_kernel={} stream_dependencies={} json_events={} parquet_rows={} anchor_ns={} alignment_anchor={}",
         args.report,
         kernels.len(),
+        cuda_api_count,
+        launch_dependencies,
         nvtx.len(),
         projected_nvtx,
         dependency_count,

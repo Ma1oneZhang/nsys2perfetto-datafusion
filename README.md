@@ -7,6 +7,7 @@ The converter reads Parquet with Apache DataFusion and does not use SQLite.
 ## Features
 
 - CUDA kernel slices with device, context, stream, correlation, grid, and block metadata
+- CPU CUDA Runtime launch slices linked to GPU kernel execution with Perfetto flows
 - NVTX push/pop ranges and NVTX-to-kernel projection using CUDA Runtime overlap
 - Multi-GPU processes, with projected NVTX tracks separated by CUDA device
 - Numeric Perfetto flow events between consecutive kernels on each CUDA stream
@@ -48,6 +49,11 @@ cargo run --locked --release -- \
 Open the JSON at [ui.perfetto.dev](https://ui.perfetto.dev/). The JSON uses
 Chrome Trace Event format and emits `s`/`f` flow pairs with numeric IDs so the
 dependency arrows are accepted by Perfetto.
+
+Every matched kernel launch emits a `cuda_launch_dependency` flow from the CPU
+CUDA Runtime API slice to the corresponding GPU kernel. Matching uses the
+Nsight `(PID, correlationId)` relationship. Same-stream kernel ordering remains
+available separately as `cuda_dependency` flows.
 
 ## Stream dependencies
 
