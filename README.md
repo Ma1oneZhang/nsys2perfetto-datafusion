@@ -8,6 +8,7 @@ The converter reads Parquet with Apache DataFusion and does not use SQLite.
 
 - CUDA kernel slices with device, context, stream, correlation, grid, and block metadata
 - NVTX push/pop ranges and NVTX-to-kernel projection using CUDA Runtime overlap
+- Multi-GPU processes, with projected NVTX tracks separated by CUDA device
 - Numeric Perfetto flow events between consecutive kernels on each CUDA stream
 - Aligned event Parquet for DuckDB/DataFusion queries
 - A separate dependency Parquet with predecessor/successor kernel IDs and stream gaps
@@ -27,6 +28,9 @@ nsys export \
 
 The Parquet directory must include the native Nsight string, CUDA kernel, CUDA
 Runtime, and NVTX tables used by the trace.
+
+`aligned_ts_us` uses the first `CriticalPath/MeasuredBatch/.../batch_0` NVTX
+range when present, and otherwise falls back to the first trace event.
 
 ## Run
 

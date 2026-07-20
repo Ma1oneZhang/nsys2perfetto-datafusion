@@ -1,4 +1,4 @@
-use std::collections::{BTreeSet, HashMap};
+use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::fs::{self, File};
 use std::io::{BufWriter, Write};
 use std::path::{Path, PathBuf};
@@ -57,7 +57,6 @@ struct RuntimeCall {
     end: i64,
     global_tid: i64,
     correlation: i64,
-    device: i64,
 }
 
 #[derive(Debug)]
@@ -67,8 +66,7 @@ struct NvtxRange {
     name: String,
     pid: i64,
     tid: i64,
-    device: i64,
-    kernel_bounds: Option<(i64, i64)>,
+    kernel_bounds: BTreeMap<i64, (i64, i64)>,
 }
 
 #[derive(Serialize)]
@@ -301,8 +299,7 @@ async fn load_nvtx(ctx: &SessionContext) -> Result<Vec<NvtxRange>> {
                 name: string_at(&batch, "nvtx_name", row)?,
                 pid: (gid / GLOBAL_ID_RADIX) % GLOBAL_ID_RADIX,
                 tid: gid % GLOBAL_ID_RADIX,
-                device: -1,
-                kernel_bounds: None,
+                kernel_bounds: BTreeMap::new(),
             });
         }
     }
@@ -332,42 +329,10 @@ async fn load_runtime(ctx: &SessionContext) -> Result<Vec<RuntimeCall>> {
                 end: end.value(row),
                 global_tid: global_tid.value(row),
                 correlation: correlation.value(row),
-                device: -1,
             });
         }
     }
     Ok(calls)
-}
-
-fn link_processes_to_devices(
-    kernels: &[Kernel],
-    nvtx: &mut [NvtxRange],
-    runtime: &mut [RuntimeCall],
-) -> Result<HashMap<i64, i64>> {
-    let mut pid_to_device = HashMap::new();
-    for kernel in kernels {
-        let pid = (kernel.global_pid / GLOBAL_ID_RADIX) % GLOBAL_ID_RADIX;
-        if let Some(previous) = pid_to_device.insert(pid, kernel.device) {
-            if previous != kernel.device {
-                bail!(
-                    "process {pid} is associated with devices {previous} and {}",
-                    kernel.device
-                );
-            }
-        }
-    }
-    for range in nvtx {
-        range.device = *pid_to_device
-            .get(&range.pid)
-            .ok_or_else(|| anyhow!("NVTX process {} has no CUDA device", range.pid))?;
-    }
-    for call in runtime {
-        let pid = (call.global_tid / GLOBAL_ID_RADIX) % GLOBAL_ID_RADIX;
-        call.device = *pid_to_device
-            .get(&pid)
-            .ok_or_else(|| anyhow!("CUDA Runtime process {pid} has no CUDA device"))?;
-    }
-    Ok(pid_to_device)
 }
 
 #[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
@@ -383,23 +348,50 @@ fn project_nvtx_to_kernels(
     nvtx: &mut [NvtxRange],
     runtime: &[RuntimeCall],
 ) {
-    let mut kernel_by_correlation = HashMap::new();
+    let mut kernels_by_process_correlation: HashMap<(i64, i64), Vec<usize>> = HashMap::new();
     for (idx, kernel) in kernels.iter().enumerate() {
-        kernel_by_correlation.insert((kernel.device, kernel.correlation), idx);
+        let pid = (kernel.global_pid / GLOBAL_ID_RADIX) % GLOBAL_ID_RADIX;
+        kernels_by_process_correlation
+            .entry((pid, kernel.correlation))
+            .or_default()
+            .push(idx);
     }
 
-    let devices: BTreeSet<i64> = kernels.iter().map(|k| k.device).collect();
-    for device in devices {
+    let process_devices: BTreeSet<(i64, i64)> = kernels
+        .iter()
+        .map(|kernel| {
+            (
+                (kernel.global_pid / GLOBAL_ID_RADIX) % GLOBAL_ID_RADIX,
+                kernel.device,
+            )
+        })
+        .collect();
+
+    // nsys2json overlaps all NVTX and CUDA API intervals on a device, then
+    // follows correlationId to a kernel. Grouping by process as well prevents
+    // unrelated processes on the same GPU from contaminating one another,
+    // while deliberately preserving its cross-thread overlap semantics.
+    for (pid, device) in process_devices {
         let mut boundaries: Vec<(i64, BoundaryKind, usize)> = Vec::new();
-        for (idx, range) in nvtx.iter().enumerate().filter(|(_, n)| n.device == device) {
+        for (idx, range) in nvtx
+            .iter()
+            .enumerate()
+            .filter(|(_, range)| range.pid == pid)
+        {
             boundaries.push((range.start, BoundaryKind::NvtxStart, idx));
             boundaries.push((range.end, BoundaryKind::NvtxEnd, idx));
         }
-        for (idx, call) in runtime
-            .iter()
-            .enumerate()
-            .filter(|(_, r)| r.device == device)
-        {
+        for (idx, call) in runtime.iter().enumerate().filter(|(_, call)| {
+            let call_pid = (call.global_tid / GLOBAL_ID_RADIX) % GLOBAL_ID_RADIX;
+            call_pid == pid
+                && kernels_by_process_correlation
+                    .get(&(pid, call.correlation))
+                    .is_some_and(|indices| {
+                        indices
+                            .iter()
+                            .any(|&kernel_idx| kernels[kernel_idx].device == device)
+                    })
+        }) {
             boundaries.push((call.start, BoundaryKind::ApiStart, idx));
             boundaries.push((call.end, BoundaryKind::ApiEnd, idx));
         }
@@ -417,26 +409,99 @@ fn project_nvtx_to_kernels(
                 BoundaryKind::ApiEnd => {}
                 BoundaryKind::ApiStart => {
                     let call = &runtime[idx];
-                    let Some(&kernel_idx) = kernel_by_correlation.get(&(device, call.correlation))
+                    let Some(kernel_indices) =
+                        kernels_by_process_correlation.get(&(pid, call.correlation))
                     else {
                         continue;
                     };
-                    let kernel_start = kernels[kernel_idx].start;
-                    let kernel_end = kernels[kernel_idx].end;
-                    for &nvtx_idx in &active_nvtx {
-                        let range = &mut nvtx[nvtx_idx];
-                        range.kernel_bounds = Some(match range.kernel_bounds {
-                            None => (kernel_start, kernel_end),
-                            Some((start, end)) => (start.min(kernel_start), end.max(kernel_end)),
-                        });
-                        let region_name = range.name.clone();
-                        if !kernels[kernel_idx].nvtx_regions.contains(&region_name) {
-                            kernels[kernel_idx].nvtx_regions.push(region_name);
+
+                    for &kernel_idx in kernel_indices {
+                        if kernels[kernel_idx].device != device {
+                            continue;
+                        }
+                        let kernel_start = kernels[kernel_idx].start;
+                        let kernel_end = kernels[kernel_idx].end;
+                        for &nvtx_idx in &active_nvtx {
+                            let range = &mut nvtx[nvtx_idx];
+                            range
+                                .kernel_bounds
+                                .entry(device)
+                                .and_modify(|bounds| {
+                                    bounds.0 = bounds.0.min(kernel_start);
+                                    bounds.1 = bounds.1.max(kernel_end);
+                                })
+                                .or_insert((kernel_start, kernel_end));
+                            let region_name = range.name.clone();
+                            if !kernels[kernel_idx].nvtx_regions.contains(&region_name) {
+                                kernels[kernel_idx].nvtx_regions.push(region_name);
+                            }
                         }
                     }
                 }
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn test_kernel(pid: i64, device: i64, correlation: i64, start: i64) -> Kernel {
+        Kernel {
+            start,
+            end: start + 5,
+            device,
+            context: device,
+            stream: device,
+            correlation,
+            global_pid: pid * GLOBAL_ID_RADIX,
+            name: format!("kernel_{device}"),
+            grid: [1, 1, 1],
+            block: [1, 1, 1],
+            sequence: 0,
+            event_id: String::new(),
+            predecessor: None,
+            nvtx_regions: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn projects_one_process_to_multiple_devices() {
+        let pid = 42;
+        let tid = 7;
+        let mut kernels = vec![test_kernel(pid, 0, 10, 15), test_kernel(pid, 1, 11, 25)];
+        let mut nvtx = vec![NvtxRange {
+            start: 0,
+            end: 100,
+            name: "multi_gpu_range".into(),
+            pid,
+            tid,
+            kernel_bounds: BTreeMap::new(),
+        }];
+        let runtime = vec![
+            RuntimeCall {
+                start: 10,
+                end: 12,
+                global_tid: pid * GLOBAL_ID_RADIX + tid,
+                correlation: 10,
+            },
+            RuntimeCall {
+                start: 20,
+                end: 22,
+                // Match nsys2json: NVTX/API interval overlap is per process and
+                // device, so an API call on another thread is still projected.
+                global_tid: pid * GLOBAL_ID_RADIX + tid + 1,
+                correlation: 11,
+            },
+        ];
+
+        project_nvtx_to_kernels(&mut kernels, &mut nvtx, &runtime);
+
+        assert_eq!(nvtx[0].kernel_bounds.get(&0), Some(&(15, 20)));
+        assert_eq!(nvtx[0].kernel_bounds.get(&1), Some(&(25, 30)));
+        assert_eq!(kernels[0].nvtx_regions, ["multi_gpu_range"]);
+        assert_eq!(kernels[1].nvtx_regions, ["multi_gpu_range"]);
     }
 }
 
@@ -586,7 +651,7 @@ fn emit_outputs(
     }
 
     for range in nvtx {
-        let pid = format!("Device {}", range.device);
+        let pid = format!("Process {}", range.pid);
         let tid = format!("NVTX Thread {}", range.tid);
         let ts_us = ns_to_us(range.start - origin_ns);
         let dur_us = ns_to_us(range.end - range.start);
@@ -624,7 +689,8 @@ fn emit_outputs(
             dependency_type: None,
         });
 
-        if let Some((kernel_start, kernel_end)) = range.kernel_bounds {
+        for (&device, &(kernel_start, kernel_end)) in &range.kernel_bounds {
+            let projected_pid = format!("Device {device}");
             let projected_tid = format!("NVTX Kernel Thread {}", range.tid);
             let projected_ts_us = ns_to_us(kernel_start - origin_ns);
             let projected_dur_us = ns_to_us(kernel_end - kernel_start);
@@ -635,8 +701,8 @@ fn emit_outputs(
                 ts: projected_ts_us,
                 dur: Some(projected_dur_us),
                 tid: projected_tid.clone(),
-                pid: pid.clone(),
-                args: json!({}),
+                pid: projected_pid.clone(),
+                args: json!({"sourcePid": range.pid, "sourceTid": range.tid, "deviceId": device}),
                 id: None,
                 bp: None,
             })?;
@@ -650,9 +716,11 @@ fn emit_outputs(
                 ts_us: projected_ts_us,
                 dur_us: Some(projected_dur_us),
                 aligned_ts_us: ns_to_us(kernel_start - anchor_ns),
-                pid: pid.clone(),
+                pid: projected_pid,
                 tid: projected_tid,
-                args_json: "{}".into(),
+                args_json:
+                    json!({"sourcePid": range.pid, "sourceTid": range.tid, "deviceId": device})
+                        .to_string(),
                 event_id: None,
                 stream_id: None,
                 correlation_id: None,
@@ -874,8 +942,7 @@ async fn main() -> Result<()> {
         tokio::join!(load_kernels(&ctx), load_nvtx(&ctx), load_runtime(&ctx),);
     let mut kernels = kernels_result?;
     let mut nvtx = nvtx_result?;
-    let mut runtime = runtime_result?;
-    link_processes_to_devices(&kernels, &mut nvtx, &mut runtime)?;
+    let runtime = runtime_result?;
     project_nvtx_to_kernels(&mut kernels, &mut nvtx, &runtime);
     assign_stream_dependencies(&args.report, &mut kernels);
 
@@ -885,16 +952,24 @@ async fn main() -> Result<()> {
         .chain(nvtx.iter().map(|n| n.start))
         .min()
         .context("trace contains no kernel or NVTX ranges")?;
-    let anchor_ns = nvtx
+    let measured_batch_anchor = nvtx
         .iter()
         .filter(|n| {
             n.name.starts_with("CriticalPath/MeasuredBatch/") && n.name.ends_with("/batch_0")
         })
         .map(|n| n.start)
-        .min()
-        .context("no CriticalPath/MeasuredBatch/.../batch_0 NVTX anchor")?;
+        .min();
+    let anchor_ns = measured_batch_anchor.unwrap_or(origin_ns);
+    let alignment_anchor = if measured_batch_anchor.is_some() {
+        "critical_path_batch_0"
+    } else {
+        eprintln!(
+            "warning: no CriticalPath/MeasuredBatch/.../batch_0 NVTX anchor; using first trace event"
+        );
+        "first_trace_event"
+    };
 
-    let projected_nvtx = nvtx.iter().filter(|n| n.kernel_bounds.is_some()).count();
+    let projected_nvtx: usize = nvtx.iter().map(|n| n.kernel_bounds.len()).sum();
     let (trace_rows, dependencies, json_events) = emit_outputs(
         &args.report,
         &args.output_json,
@@ -914,7 +989,7 @@ async fn main() -> Result<()> {
     .await?;
 
     println!(
-        "report={} kernels={} nvtx={} nvtx_kernel={} dependencies={} json_events={} parquet_rows={} anchor_ns={}",
+        "report={} kernels={} nvtx={} nvtx_kernel={} dependencies={} json_events={} parquet_rows={} anchor_ns={} alignment_anchor={}",
         args.report,
         kernels.len(),
         nvtx.len(),
@@ -923,6 +998,7 @@ async fn main() -> Result<()> {
         json_events,
         trace_row_count,
         anchor_ns,
+        alignment_anchor,
     );
     Ok(())
 }
