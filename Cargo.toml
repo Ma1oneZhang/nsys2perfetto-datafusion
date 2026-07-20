@@ -1,12 +1,13 @@
 [package]
 name = "nsys2perfetto-datafusion"
-version = "0.1.2"
+version = "0.1.3"
 edition = "2024"
 rust-version = "1.88"
 description = "Convert Nsight Systems Parquet exports to Perfetto JSON and aligned Parquet with DataFusion"
 license = "Apache-2.0"
 repository = "https://github.com/Ma1oneZhang/nsys2perfetto-datafusion"
 homepage = "https://github.com/Ma1oneZhang/nsys2perfetto-datafusion"
+readme = "README.md"
 keywords = ["nsight", "perfetto", "cuda", "parquet", "datafusion"]
 categories = ["command-line-utilities", "development-tools::profiling"]
 
