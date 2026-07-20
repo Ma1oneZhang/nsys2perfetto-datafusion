@@ -5,7 +5,7 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use anyhow::{Context, Result, anyhow, bail};
-use clap::Parser;
+use clap::{Parser, ValueEnum};
 use datafusion::arrow::array::{
     Array, Float64Array, Int64Array, StringArray, StringViewArray, UInt32Array, UInt64Array,
 };
@@ -31,6 +31,24 @@ struct Args {
     output_parquet: PathBuf,
     #[arg(long)]
     output_dependencies: PathBuf,
+    #[arg(long, value_enum, default_value_t = NvtxProjection::Thread)]
+    nvtx_projection: NvtxProjection,
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, ValueEnum)]
+enum NvtxProjection {
+    #[default]
+    Thread,
+    Process,
+}
+
+impl std::fmt::Display for NvtxProjection {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Thread => formatter.write_str("thread"),
+            Self::Process => formatter.write_str("process"),
+        }
+    }
 }
 
 #[derive(Debug)]
@@ -67,6 +85,7 @@ struct NvtxRange {
     start: i64,
     end: i64,
     name: String,
+    global_tid: i64,
     pid: i64,
     tid: i64,
     kernel_bounds: BTreeMap<i64, (i64, i64)>,
@@ -302,6 +321,7 @@ async fn load_nvtx(ctx: &SessionContext) -> Result<Vec<NvtxRange>> {
                 start: start.value(row),
                 end: end.value(row),
                 name: string_at(&batch, "nvtx_name", row)?,
+                global_tid: gid,
                 pid: (gid / GLOBAL_ID_RADIX) % GLOBAL_ID_RADIX,
                 tid: gid % GLOBAL_ID_RADIX,
                 kernel_bounds: BTreeMap::new(),
@@ -393,7 +413,87 @@ fn link_runtime_calls_to_kernels(
     links
 }
 
-fn project_nvtx_to_kernels(
+fn attach_nvtx_range_to_kernel(
+    kernels: &mut [Kernel],
+    nvtx: &mut [NvtxRange],
+    kernel_idx: usize,
+    nvtx_idx: usize,
+) {
+    let kernel = &mut kernels[kernel_idx];
+    let range = &mut nvtx[nvtx_idx];
+    range
+        .kernel_bounds
+        .entry(kernel.device)
+        .and_modify(|bounds| {
+            bounds.0 = bounds.0.min(kernel.start);
+            bounds.1 = bounds.1.max(kernel.end);
+        })
+        .or_insert((kernel.start, kernel.end));
+    if !kernel.nvtx_regions.contains(&range.name) {
+        kernel.nvtx_regions.push(range.name.clone());
+    }
+}
+
+fn project_nvtx_to_kernels_by_thread(
+    kernels: &mut [Kernel],
+    nvtx: &mut [NvtxRange],
+    runtime: &[RuntimeCall],
+) {
+    let mut kernels_by_launch_call: HashMap<usize, Vec<usize>> = HashMap::new();
+    for (kernel_idx, kernel) in kernels.iter().enumerate() {
+        if let Some(call_idx) = kernel.launch_call {
+            kernels_by_launch_call
+                .entry(call_idx)
+                .or_default()
+                .push(kernel_idx);
+        }
+    }
+
+    let global_tids: BTreeSet<i64> = nvtx.iter().map(|range| range.global_tid).collect();
+    for global_tid in global_tids {
+        let mut boundaries: Vec<(i64, BoundaryKind, usize)> = Vec::new();
+        for (idx, range) in nvtx
+            .iter()
+            .enumerate()
+            .filter(|(_, range)| range.global_tid == global_tid)
+        {
+            boundaries.push((range.start, BoundaryKind::NvtxStart, idx));
+            boundaries.push((range.end, BoundaryKind::NvtxEnd, idx));
+        }
+        for (idx, call) in runtime.iter().enumerate().filter(|(idx, call)| {
+            call.global_tid == global_tid && kernels_by_launch_call.contains_key(idx)
+        }) {
+            boundaries.push((call.start, BoundaryKind::ApiStart, idx));
+            boundaries.push((call.end, BoundaryKind::ApiEnd, idx));
+        }
+        boundaries.sort_unstable_by_key(|&(time, kind, idx)| (time, kind, idx));
+
+        let mut active_nvtx = BTreeSet::new();
+        for (_, kind, idx) in boundaries {
+            match kind {
+                BoundaryKind::NvtxStart => {
+                    active_nvtx.insert(idx);
+                }
+                BoundaryKind::NvtxEnd => {
+                    active_nvtx.remove(&idx);
+                }
+                BoundaryKind::ApiEnd => {}
+                BoundaryKind::ApiStart => {
+                    let Some(kernel_indices) = kernels_by_launch_call.get(&idx) else {
+                        continue;
+                    };
+                    for &kernel_idx in kernel_indices {
+                        for &nvtx_idx in &active_nvtx {
+                            attach_nvtx_range_to_kernel(kernels, nvtx, kernel_idx, nvtx_idx);
+                        }
+                    }
+                }
+            }
+        }
+    }
+}
+
+fn project_nvtx_to_kernels_by_process(
     kernels: &mut [Kernel],
     nvtx: &mut [NvtxRange],
     runtime: &[RuntimeCall],
@@ -469,22 +569,8 @@ fn project_nvtx_to_kernels(
                         if kernels[kernel_idx].device != device {
                             continue;
                         }
-                        let kernel_start = kernels[kernel_idx].start;
-                        let kernel_end = kernels[kernel_idx].end;
                         for &nvtx_idx in &active_nvtx {
-                            let range = &mut nvtx[nvtx_idx];
-                            range
-                                .kernel_bounds
-                                .entry(device)
-                                .and_modify(|bounds| {
-                                    bounds.0 = bounds.0.min(kernel_start);
-                                    bounds.1 = bounds.1.max(kernel_end);
-                                })
-                                .or_insert((kernel_start, kernel_end));
-                            let region_name = range.name.clone();
-                            if !kernels[kernel_idx].nvtx_regions.contains(&region_name) {
-                                kernels[kernel_idx].nvtx_regions.push(region_name);
-                            }
+                            attach_nvtx_range_to_kernel(kernels, nvtx, kernel_idx, nvtx_idx);
                         }
                     }
                 }
@@ -493,7 +579,20 @@ fn project_nvtx_to_kernels(
     }
 }
 
+fn project_nvtx_to_kernels(
+    kernels: &mut [Kernel],
+    nvtx: &mut [NvtxRange],
+    runtime: &[RuntimeCall],
+    projection: NvtxProjection,
+) {
+    match projection {
+        NvtxProjection::Thread => project_nvtx_to_kernels_by_thread(kernels, nvtx, runtime),
+        NvtxProjection::Process => project_nvtx_to_kernels_by_process(kernels, nvtx, runtime),
+    }
+}
+
 #[cfg(test)]
+#[allow(clippy::items_after_test_module)]
 mod tests {
     use super::*;
 
@@ -518,7 +617,7 @@ mod tests {
     }
 
     #[test]
-    fn projects_one_process_to_multiple_devices() {
+    fn thread_projection_projects_one_thread_to_multiple_devices() {
         let pid = 42;
         let tid = 7;
         let mut kernels = vec![test_kernel(pid, 0, 10, 15), test_kernel(pid, 1, 11, 25)];
@@ -526,6 +625,7 @@ mod tests {
             start: 0,
             end: 100,
             name: "multi_gpu_range".into(),
+            global_tid: pid * GLOBAL_ID_RADIX + tid,
             pid,
             tid,
             kernel_bounds: BTreeMap::new(),
@@ -542,9 +642,7 @@ mod tests {
             RuntimeCall {
                 start: 20,
                 end: 22,
-                // Match nsys2json: NVTX/API interval overlap is per process and
-                // device, so an API call on another thread is still projected.
-                global_tid: pid * GLOBAL_ID_RADIX + tid + 1,
+                global_tid: pid * GLOBAL_ID_RADIX + tid,
                 correlation: 11,
                 name: "cudaLaunchKernel".into(),
                 event_id: None,
@@ -555,7 +653,7 @@ mod tests {
             link_runtime_calls_to_kernels("report", &mut kernels, &mut runtime),
             2
         );
-        project_nvtx_to_kernels(&mut kernels, &mut nvtx, &runtime);
+        project_nvtx_to_kernels(&mut kernels, &mut nvtx, &runtime, NvtxProjection::Thread);
 
         assert_eq!(kernels[0].launch_call, Some(0));
         assert_eq!(kernels[1].launch_call, Some(1));
@@ -565,8 +663,105 @@ mod tests {
         assert_eq!(kernels[0].nvtx_regions, ["multi_gpu_range"]);
         assert_eq!(kernels[1].nvtx_regions, ["multi_gpu_range"]);
     }
+
+    #[test]
+    fn thread_projection_keeps_overlapping_worker_ranges_separate() {
+        let pid = 42;
+        let verify_tid = 7;
+        let draft_tid = 8;
+        let mut kernels = vec![test_kernel(pid, 0, 10, 15), test_kernel(pid, 1, 11, 25)];
+        let mut nvtx = vec![
+            NvtxRange {
+                start: 0,
+                end: 100,
+                name: "Verify".into(),
+                global_tid: pid * GLOBAL_ID_RADIX + verify_tid,
+                pid,
+                tid: verify_tid,
+                kernel_bounds: BTreeMap::new(),
+            },
+            NvtxRange {
+                start: 0,
+                end: 100,
+                name: "DraftForward".into(),
+                global_tid: pid * GLOBAL_ID_RADIX + draft_tid,
+                pid,
+                tid: draft_tid,
+                kernel_bounds: BTreeMap::new(),
+            },
+        ];
+        let mut runtime = vec![
+            RuntimeCall {
+                start: 10,
+                end: 12,
+                global_tid: pid * GLOBAL_ID_RADIX + verify_tid,
+                correlation: 10,
+                name: "cudaLaunchKernel".into(),
+                event_id: None,
+            },
+            RuntimeCall {
+                start: 20,
+                end: 22,
+                global_tid: pid * GLOBAL_ID_RADIX + draft_tid,
+                correlation: 11,
+                name: "cudaLaunchKernel".into(),
+                event_id: None,
+            },
+        ];
+
+        link_runtime_calls_to_kernels("report", &mut kernels, &mut runtime);
+        project_nvtx_to_kernels(&mut kernels, &mut nvtx, &runtime, NvtxProjection::Thread);
+
+        assert_eq!(kernels[0].nvtx_regions, ["Verify"]);
+        assert_eq!(kernels[1].nvtx_regions, ["DraftForward"]);
+        assert_eq!(nvtx[0].kernel_bounds.get(&0), Some(&(15, 20)));
+        assert_eq!(nvtx[0].kernel_bounds.get(&1), None);
+        assert_eq!(nvtx[1].kernel_bounds.get(&0), None);
+        assert_eq!(nvtx[1].kernel_bounds.get(&1), Some(&(25, 30)));
+    }
+
+    #[test]
+    fn process_projection_preserves_legacy_cross_thread_overlap() {
+        let pid = 42;
+        let tid = 7;
+        let mut kernels = vec![test_kernel(pid, 0, 10, 15), test_kernel(pid, 1, 11, 25)];
+        let mut nvtx = vec![NvtxRange {
+            start: 0,
+            end: 100,
+            name: "legacy_range".into(),
+            global_tid: pid * GLOBAL_ID_RADIX + tid,
+            pid,
+            tid,
+            kernel_bounds: BTreeMap::new(),
+        }];
+        let mut runtime = vec![
+            RuntimeCall {
+                start: 10,
+                end: 12,
+                global_tid: pid * GLOBAL_ID_RADIX + tid,
+                correlation: 10,
+                name: "cudaLaunchKernel".into(),
+                event_id: None,
+            },
+            RuntimeCall {
+                start: 20,
+                end: 22,
+                global_tid: pid * GLOBAL_ID_RADIX + tid + 1,
+                correlation: 11,
+                name: "cudaLaunchKernel".into(),
+                event_id: None,
+            },
+        ];
+
+        link_runtime_calls_to_kernels("report", &mut kernels, &mut runtime);
+        project_nvtx_to_kernels(&mut kernels, &mut nvtx, &runtime, NvtxProjection::Process);
+
+        assert_eq!(kernels[0].nvtx_regions, ["legacy_range"]);
+        assert_eq!(kernels[1].nvtx_regions, ["legacy_range"]);
+    }
 }
 
+#[allow(clippy::needless_range_loop)]
 fn assign_stream_dependencies(report: &str, kernels: &mut [Kernel]) {
     let mut previous: HashMap<(i64, i64, i64), usize> = HashMap::new();
     let mut sequence: HashMap<(i64, i64, i64), u64> = HashMap::new();
@@ -1114,7 +1309,7 @@ async fn main() -> Result<()> {
     let mut runtime = runtime_result?;
     let launch_dependencies =
         link_runtime_calls_to_kernels(&args.report, &mut kernels, &mut runtime);
-    project_nvtx_to_kernels(&mut kernels, &mut nvtx, &runtime);
+    project_nvtx_to_kernels(&mut kernels, &mut nvtx, &runtime, args.nvtx_projection);
     assign_stream_dependencies(&args.report, &mut kernels);
 
     let origin_ns = kernels
@@ -1171,8 +1366,9 @@ async fn main() -> Result<()> {
     .await?;
 
     println!(
-        "report={} kernels={} cuda_api={} launch_dependencies={} nvtx={} nvtx_kernel={} stream_dependencies={} json_events={} parquet_rows={} anchor_ns={} alignment_anchor={}",
+        "report={} nvtx_projection={} kernels={} cuda_api={} launch_dependencies={} nvtx={} nvtx_kernel={} stream_dependencies={} json_events={} parquet_rows={} anchor_ns={} alignment_anchor={}",
         args.report,
+        args.nvtx_projection,
         kernels.len(),
         cuda_api_count,
         launch_dependencies,

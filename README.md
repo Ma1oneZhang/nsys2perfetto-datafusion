@@ -8,7 +8,7 @@ The converter reads Parquet with Apache DataFusion and does not use SQLite.
 
 - CUDA kernel slices with device, context, stream, correlation, grid, and block metadata
 - CPU CUDA Runtime launch slices linked to GPU kernel execution with Perfetto flows
-- NVTX push/pop ranges and NVTX-to-kernel projection using CUDA Runtime overlap
+- NVTX push/pop ranges projected through same-thread CUDA Runtime launches by default
 - Multi-GPU processes, with projected NVTX tracks separated by CUDA device
 - Numeric Perfetto flow events between consecutive kernels on each CUDA stream
 - Aligned event Parquet for DuckDB/DataFusion queries
@@ -45,6 +45,11 @@ cargo run --locked --release -- \
   --output-parquet /tmp/report.perfetto.parquet \
   --output-dependencies /tmp/report.kernel_dependencies.parquet
 ```
+
+Push/pop NVTX ranges are thread-local, so the default
+`--nvtx-projection thread` mode only associates a range with CUDA Runtime
+launches on the same Nsight `globalTid`. Use `--nvtx-projection process` only
+to reproduce the legacy process-wide `nsys2json` overlap behavior.
 
 Open the JSON at [ui.perfetto.dev](https://ui.perfetto.dev/). The JSON uses
 Chrome Trace Event format and emits `s`/`f` flow pairs with numeric IDs so the
