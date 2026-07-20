@@ -13,8 +13,11 @@ The converter reads Parquet with Apache DataFusion and does not use SQLite.
 - Explicit per-source-process `CUDA HW deviceId` tracks with context/stream lanes showing
   the CUPTI kernel start, end, and duration
 - NVTX push/pop ranges and NVTX-to-kernel projection using CUDA Runtime overlap
-- CUDA API, CPU NVTX, and GPU-projected NVTX slices grouped into adjacent,
-  overlap-safe lanes for each source CPU thread
+- Device-centric Perfetto hierarchy: every CUDA device contains its HW
+  context/stream, NVTX Kernel, CUDA API, and NVTX Thread child tracks
+- NVTX and projected NVTX emitted as timestamp-sorted begin/end stacks so
+  Perfetto preserves their push/pop parent-child hierarchy
+- Overlap-safe CUDA API lanes so Perfetto drops no complete-event slices
 - Process-aware multi-GPU tracks so process-local device IDs cannot be conflated
 - Aligned event Parquet for DuckDB/DataFusion queries
 
@@ -61,10 +64,10 @@ relationship to link to H2D, D2H, and D2D hardware intervals. Consecutive
 kernels on a stream are intentionally not connected.
 
 The Chrome JSON uses numeric process and thread IDs plus `process_name`,
-`thread_name`, and sort-index metadata. As a result, CUDA hardware execution
-tracks are grouped and displayed before host launch tracks in Perfetto. Select
-either a host launch slice or a GPU kernel slice to display their connecting
-flow arrow.
+`thread_name`, and sort-index metadata. CUDA APIs and NVTX ranges are associated
+with their device through CUPTI correlation and placed under that device rather
+than under a separate host process. Select either an API slice or a GPU kernel
+or memcpy slice to display their connecting flow arrow.
 
 The dependency Parquet argument remains for CLI compatibility and produces an
 empty, schema-valid table; only observed API-to-GPU correlation flows are shown.

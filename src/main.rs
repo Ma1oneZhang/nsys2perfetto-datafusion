@@ -783,10 +783,17 @@ fn emit_outputs(
     anchor_ns: i64,
 ) -> Result<(Vec<TraceRow>, Vec<DependencyRow>, usize)> {
     #[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
-    enum HostSliceKey {
-        Runtime(usize),
-        Nvtx(usize),
+    enum DeviceSliceKey {
+        Runtime(usize, i64),
+        Nvtx(usize, i64),
         ProjectedNvtx(usize, i64),
+    }
+
+    #[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+    enum DeviceTrackKind {
+        ProjectedNvtx,
+        Runtime,
+        Nvtx,
     }
 
     let mut writer = JsonArrayWriter::create(output_json)?;
@@ -835,36 +842,91 @@ fn emit_outputs(
         .enumerate()
         .map(|(idx, &key)| (key, idx as i64 + 1))
         .collect();
-    // Chrome complete events cannot overlap on one track. Group all CPU API,
-    // NVTX, and projected NVTX intervals by source thread, then greedily place
-    // them on the minimum number of adjacent lanes. This keeps corresponding
-    // content visually together without Perfetto dropping overlapping slices.
-    let mut host_intervals: BTreeMap<(i64, i64), Vec<(i64, i64, HostSliceKey)>> = BTreeMap::new();
-    for (idx, call) in runtime
+    let mut call_devices: BTreeMap<usize, BTreeSet<i64>> = BTreeMap::new();
+    for kernel in kernels {
+        if let Some(call_idx) = kernel.launch_call {
+            call_devices
+                .entry(call_idx)
+                .or_default()
+                .insert(kernel.device);
+        }
+    }
+    for copy in memcpys {
+        if let Some(call_idx) = copy.launch_call {
+            call_devices
+                .entry(call_idx)
+                .or_default()
+                .insert(copy.device);
+        }
+    }
+    let process_devices: BTreeMap<i64, BTreeSet<i64>> =
+        gpu_keys
+            .iter()
+            .fold(BTreeMap::new(), |mut devices, &(pid, device)| {
+                devices.entry(pid).or_default().insert(device);
+                devices
+            });
+
+    // Place CUDA API tracks under each CUDA device process. Complete CUDA API
+    // events can overlap, so allocate the minimum number of adjacent lanes.
+    // NVTX tracks are allocated separately below and use B/E stack events to
+    // preserve push/pop hierarchy on one track per source thread.
+    let mut device_intervals: BTreeMap<
+        (i64, i64, DeviceTrackKind, i64),
+        Vec<(i64, i64, DeviceSliceKey)>,
+    > = BTreeMap::new();
+    for (&call_idx, devices) in &call_devices {
+        let call = &runtime[call_idx];
+        let pid = source_pid(call.global_tid);
+        let tid = call.global_tid % GLOBAL_ID_RADIX;
+        for &device in devices {
+            device_intervals
+                .entry((pid, device, DeviceTrackKind::Runtime, tid))
+                .or_default()
+                .push((
+                    call.start,
+                    call.end,
+                    DeviceSliceKey::Runtime(call_idx, device),
+                ));
+        }
+    }
+    let mut device_slice_tracks = BTreeMap::new();
+    let mut device_track_metadata = Vec::new();
+    let projected_track_keys: BTreeSet<(i64, i64, i64)> = nvtx
+        .iter()
+        .flat_map(|range| {
+            range
+                .kernel_bounds
+                .keys()
+                .map(move |&device| (range.pid, device, range.tid))
+        })
+        .collect();
+    let projected_tracks: BTreeMap<(i64, i64, i64), i64> = projected_track_keys
         .iter()
         .enumerate()
-        .filter(|(_, call)| call.event_id.is_some())
-    {
-        host_intervals
-            .entry((
-                source_pid(call.global_tid),
-                call.global_tid % GLOBAL_ID_RADIX,
-            ))
-            .or_default()
-            .push((call.start, call.end, HostSliceKey::Runtime(idx)));
+        .map(|(idx, &key)| (key, 1_000_000_000_i64 + idx as i64))
+        .collect();
+    for (&(pid, device, source_tid), &tid) in &projected_tracks {
+        device_track_metadata.push((
+            pid,
+            device,
+            DeviceTrackKind::ProjectedNvtx,
+            tid,
+            source_tid,
+            None,
+        ));
     }
-    for (idx, range) in nvtx.iter().enumerate() {
-        let intervals = host_intervals.entry((range.pid, range.tid)).or_default();
-        intervals.push((range.start, range.end, HostSliceKey::Nvtx(idx)));
-        intervals.extend(range.kernel_bounds.iter().map(|(&device, &(start, end))| {
-            (start, end, HostSliceKey::ProjectedNvtx(idx, device))
-        }));
+    for (range_idx, range) in nvtx.iter().enumerate() {
+        for &device in range.kernel_bounds.keys() {
+            device_slice_tracks.insert(
+                DeviceSliceKey::ProjectedNvtx(range_idx, device),
+                projected_tracks[&(range.pid, device, range.tid)],
+            );
+        }
     }
-    let host_processes: BTreeSet<i64> = host_intervals.keys().map(|&(pid, _)| pid).collect();
-    let mut host_slice_tracks = BTreeMap::new();
-    let mut host_track_metadata = Vec::new();
-    let mut next_host_track = 1_000_000_000_i64;
-    for (&(pid, source_tid), intervals) in &mut host_intervals {
+
+    let mut next_device_track = 1_100_000_000_i64;
+    for (&(pid, device, kind, source_tid), intervals) in &mut device_intervals {
         intervals.sort_unstable_by_key(|&(start, end, key)| (start, end, key));
         let mut lane_ends: Vec<i64> = Vec::new();
         let mut lane_tids: Vec<i64> = Vec::new();
@@ -875,13 +937,65 @@ fn emit_outputs(
                 .unwrap_or_else(|| {
                     let lane = lane_ends.len();
                     lane_ends.push(i64::MIN);
-                    lane_tids.push(next_host_track);
-                    host_track_metadata.push((pid, next_host_track, source_tid, lane));
-                    next_host_track += 1;
+                    lane_tids.push(next_device_track);
+                    device_track_metadata.push((
+                        pid,
+                        device,
+                        kind,
+                        next_device_track,
+                        source_tid,
+                        Some(lane),
+                    ));
+                    next_device_track += 1;
                     lane
                 });
             lane_ends[lane] = end;
-            host_slice_tracks.insert(key, lane_tids[lane]);
+            device_slice_tracks.insert(key, lane_tids[lane]);
+        }
+    }
+
+    let mut nvtx_track_keys = BTreeSet::new();
+    for range in nvtx {
+        let range_devices: Vec<i64> = if range.kernel_bounds.is_empty() {
+            process_devices
+                .get(&range.pid)
+                .into_iter()
+                .flatten()
+                .copied()
+                .collect()
+        } else {
+            range.kernel_bounds.keys().copied().collect()
+        };
+        nvtx_track_keys.extend(
+            range_devices
+                .into_iter()
+                .map(|device| (range.pid, device, range.tid)),
+        );
+    }
+    let nvtx_tracks: BTreeMap<(i64, i64, i64), i64> = nvtx_track_keys
+        .iter()
+        .enumerate()
+        .map(|(idx, &key)| (key, 1_200_000_000_i64 + idx as i64))
+        .collect();
+    for (&(pid, device, source_tid), &tid) in &nvtx_tracks {
+        device_track_metadata.push((pid, device, DeviceTrackKind::Nvtx, tid, source_tid, None));
+    }
+    for (range_idx, range) in nvtx.iter().enumerate() {
+        let range_devices: Vec<i64> = if range.kernel_bounds.is_empty() {
+            process_devices
+                .get(&range.pid)
+                .into_iter()
+                .flatten()
+                .copied()
+                .collect()
+        } else {
+            range.kernel_bounds.keys().copied().collect()
+        };
+        for device in range_devices {
+            device_slice_tracks.insert(
+                DeviceSliceKey::Nvtx(range_idx, device),
+                nvtx_tracks[&(range.pid, device, range.tid)],
+            );
         }
     }
 
@@ -889,7 +1003,7 @@ fn emit_outputs(
         for (name, args) in [
             (
                 "process_name",
-                json!({"name": format!("CUDA HW PID {source_pid} / deviceId {device}")}),
+                json!({"name": format!("CUDA Device {device} / Source PID {source_pid}")}),
             ),
             (
                 "process_sort_index",
@@ -934,30 +1048,16 @@ fn emit_outputs(
             json_event_count += 1;
         }
     }
-    for pid in host_processes {
-        for (name, args) in [
-            (
-                "process_name",
-                json!({"name": format!("CUDA Host Process {pid}")}),
-            ),
-            ("process_sort_index", json!({"sort_index": 10_000 + pid})),
-        ] {
-            writer.event(&TraceEvent {
-                name: name.into(),
-                ph: "M".into(),
-                cat: "__metadata".into(),
-                ts: 0.0,
-                dur: None,
-                tid: 0,
-                pid,
-                args,
-                id: None,
-                bp: None,
-            })?;
-            json_event_count += 1;
-        }
-    }
-    for (pid, tid, source_tid, lane) in host_track_metadata {
+    for (source_pid, device, kind, tid, source_tid, lane) in device_track_metadata {
+        let track_kind = match kind {
+            DeviceTrackKind::ProjectedNvtx => "NVTX Kernel",
+            DeviceTrackKind::Runtime => "CUDA API",
+            DeviceTrackKind::Nvtx => "NVTX Thread",
+        };
+        let track_name = match lane {
+            Some(lane) => format!("{track_kind} {source_tid} / Lane {}", lane + 1),
+            None => format!("{track_kind} {source_tid}"),
+        };
         writer.event(&TraceEvent {
             name: "thread_name".into(),
             ph: "M".into(),
@@ -965,8 +1065,21 @@ fn emit_outputs(
             ts: 0.0,
             dur: None,
             tid,
-            pid,
-            args: json!({"name": format!("CUDA API / NVTX Thread {source_tid} / Lane {}", lane + 1)}),
+            pid: gpu_processes[&(source_pid, device)],
+            args: json!({"name": track_name}),
+            id: None,
+            bp: None,
+        })?;
+        json_event_count += 1;
+        writer.event(&TraceEvent {
+            name: "thread_sort_index".into(),
+            ph: "M".into(),
+            cat: "__metadata".into(),
+            ts: 0.0,
+            dur: None,
+            tid,
+            pid: gpu_processes[&(source_pid, device)],
+            args: json!({"sort_index": tid}),
             id: None,
             bp: None,
         })?;
@@ -980,9 +1093,6 @@ fn emit_outputs(
     {
         let pid_number = (call.global_tid / GLOBAL_ID_RADIX) % GLOBAL_ID_RADIX;
         let tid_number = call.global_tid % GLOBAL_ID_RADIX;
-        let pid_label = format!("Process {pid_number}");
-        let host_tid = host_slice_tracks[&HostSliceKey::Runtime(call_idx)];
-        let tid_label = format!("CUDA API / NVTX Thread {tid_number}");
         let event_id = call
             .event_id
             .as_ref()
@@ -996,39 +1106,43 @@ fn emit_outputs(
             "cpuEndNs": call.end,
             "cpuDurationNs": call.end - call.start,
         });
-        writer.event(&TraceEvent {
-            name: call.name.clone(),
-            ph: "X".into(),
-            cat: "cuda_api".into(),
-            ts: ts_us,
-            dur: Some(dur_us),
-            tid: host_tid,
-            pid: pid_number,
-            args: args.clone(),
-            id: None,
-            bp: None,
-        })?;
-        json_event_count += 1;
-        rows.push(TraceRow {
-            report: report.into(),
-            event_type: "cuda_api".into(),
-            cat: "cuda_api".into(),
-            name: call.name.clone(),
-            ph: "X".into(),
-            ts_us,
-            dur_us: Some(dur_us),
-            aligned_ts_us: ns_to_us(call.start - anchor_ns),
-            pid: pid_label,
-            tid: tid_label,
-            args_json: args.to_string(),
-            event_id: Some(event_id.clone()),
-            launch_event_id: None,
-            stream_id: None,
-            correlation_id: Some(call.correlation as u32),
-            stream_sequence: None,
-            depends_on_event_id: None,
-            dependency_type: None,
-        });
+        for &device in &call_devices[&call_idx] {
+            let mut device_args = args.clone();
+            device_args["deviceId"] = json!(device);
+            writer.event(&TraceEvent {
+                name: call.name.clone(),
+                ph: "X".into(),
+                cat: "cuda_api".into(),
+                ts: ts_us,
+                dur: Some(dur_us),
+                tid: device_slice_tracks[&DeviceSliceKey::Runtime(call_idx, device)],
+                pid: gpu_processes[&(pid_number, device)],
+                args: device_args.clone(),
+                id: None,
+                bp: None,
+            })?;
+            json_event_count += 1;
+            rows.push(TraceRow {
+                report: report.into(),
+                event_type: "cuda_api".into(),
+                cat: "cuda_api".into(),
+                name: call.name.clone(),
+                ph: "X".into(),
+                ts_us,
+                dur_us: Some(dur_us),
+                aligned_ts_us: ns_to_us(call.start - anchor_ns),
+                pid: format!("CUDA Device {device} / Source PID {pid_number}"),
+                tid: format!("CUDA API Thread {tid_number}"),
+                args_json: device_args.to_string(),
+                event_id: Some(event_id.clone()),
+                launch_event_id: None,
+                stream_id: None,
+                correlation_id: Some(call.correlation as u32),
+                stream_sequence: None,
+                depends_on_event_id: None,
+                dependency_type: None,
+            });
+        }
     }
 
     for (kernel_idx, kernel) in kernels.iter().enumerate() {
@@ -1055,8 +1169,8 @@ fn emit_outputs(
         let ts_us = ns_to_us(kernel.start - origin_ns);
         let dur_us = ns_to_us(kernel.end - kernel.start);
         let pid_label = format!(
-            "CUDA HW PID {} / deviceId {}",
-            kernel_source_pid, kernel.device
+            "CUDA Device {} / Source PID {}",
+            kernel.device, kernel_source_pid
         );
         let tid_label = format!("Context {} / Stream {}", kernel.context, kernel.stream);
         let gpu_pid = gpu_processes[&(kernel_source_pid, kernel.device)];
@@ -1106,8 +1220,8 @@ fn emit_outputs(
                 .event_id
                 .as_ref()
                 .context("kernel launch call has no event ID")?;
-            let call_pid = (call.global_tid / GLOBAL_ID_RADIX) % GLOBAL_ID_RADIX;
-            let call_tid = host_slice_tracks[&HostSliceKey::Runtime(call_idx)];
+            let call_pid = gpu_pid;
+            let call_tid = device_slice_tracks[&DeviceSliceKey::Runtime(call_idx, kernel.device)];
             let flow_id = LAUNCH_FLOW_ID_BASE + kernel_idx as u64;
             let flow_args = json!({
                 "from": call_event_id,
@@ -1206,7 +1320,7 @@ fn emit_outputs(
             ts_us,
             dur_us: Some(dur_us),
             aligned_ts_us: ns_to_us(copy.start - anchor_ns),
-            pid: format!("CUDA HW PID {copy_source_pid} / deviceId {}", copy.device),
+            pid: format!("CUDA Device {} / Source PID {copy_source_pid}", copy.device),
             tid: format!("Context {} / Stream {}", copy.context, copy.stream),
             args_json: args.to_string(),
             event_id: Some(copy.event_id.clone()),
@@ -1223,8 +1337,8 @@ fn emit_outputs(
                 .event_id
                 .as_ref()
                 .context("memcpy API call has no event ID")?;
-            let call_pid = source_pid(call.global_tid);
-            let call_tid = host_slice_tracks[&HostSliceKey::Runtime(call_idx)];
+            let call_pid = gpu_pid;
+            let call_tid = device_slice_tracks[&DeviceSliceKey::Runtime(call_idx, copy.device)];
             let flow_id = MEMCPY_FLOW_ID_BASE + copy_idx as u64;
             let flow_args = json!({
                 "from": call_event_id, "to": copy.event_id, "direction": direction,
@@ -1267,66 +1381,128 @@ fn emit_outputs(
         }
     }
 
+    // Emit NVTX as timestamp-sorted begin/end stacks. For equal timestamps,
+    // close inner ranges first and open outer ranges first. Perfetto can then
+    // reconstruct the original push/pop nesting instead of flattening ranges.
+    let mut nvtx_boundaries = Vec::new();
     for (range_idx, range) in nvtx.iter().enumerate() {
-        let pid_label = format!("Process {}", range.pid);
-        let tid_label = format!("CUDA API / NVTX Thread {}", range.tid);
-        let ts_us = ns_to_us(range.start - origin_ns);
-        let dur_us = ns_to_us(range.end - range.start);
-        let args = json!({"sourcePid": range.pid, "sourceTid": range.tid});
+        let range_devices: Vec<i64> = if range.kernel_bounds.is_empty() {
+            process_devices
+                .get(&range.pid)
+                .into_iter()
+                .flatten()
+                .copied()
+                .collect()
+        } else {
+            range.kernel_bounds.keys().copied().collect()
+        };
+        for device in range_devices {
+            let pid = gpu_processes[&(range.pid, device)];
+            let tid = device_slice_tracks[&DeviceSliceKey::Nvtx(range_idx, device)];
+            nvtx_boundaries.push((
+                pid,
+                tid,
+                range.start,
+                true,
+                range.start,
+                range.end,
+                range_idx,
+                device,
+                false,
+            ));
+            nvtx_boundaries.push((
+                pid,
+                tid,
+                range.end,
+                false,
+                range.start,
+                range.end,
+                range_idx,
+                device,
+                false,
+            ));
+        }
+        for (&device, &(start, end)) in &range.kernel_bounds {
+            let pid = gpu_processes[&(range.pid, device)];
+            let tid = device_slice_tracks[&DeviceSliceKey::ProjectedNvtx(range_idx, device)];
+            nvtx_boundaries.push((pid, tid, start, true, start, end, range_idx, device, true));
+            nvtx_boundaries.push((pid, tid, end, false, start, end, range_idx, device, true));
+        }
+    }
+    nvtx_boundaries.sort_unstable_by(|a, b| {
+        (a.0, a.1, a.2)
+            .cmp(&(b.0, b.1, b.2))
+            .then_with(|| match (a.3, b.3) {
+                (false, true) => std::cmp::Ordering::Less,
+                (true, false) => std::cmp::Ordering::Greater,
+                (true, true) => b.5.cmp(&a.5),
+                (false, false) => b.4.cmp(&a.4),
+            })
+            .then_with(|| a.6.cmp(&b.6))
+    });
+    for (pid, tid, time, is_start, _, _, range_idx, device, projected) in nvtx_boundaries {
+        let range = &nvtx[range_idx];
         writer.event(&TraceEvent {
             name: range.name.clone(),
-            ph: "X".into(),
-            cat: "nvtx".into(),
-            ts: ts_us,
-            dur: Some(dur_us),
-            tid: host_slice_tracks[&HostSliceKey::Nvtx(range_idx)],
-            pid: range.pid,
-            args: args.clone(),
+            ph: if is_start { "B" } else { "E" }.into(),
+            cat: if projected { "nvtx-kernel" } else { "nvtx" }.into(),
+            ts: ns_to_us(time - origin_ns),
+            dur: None,
+            tid,
+            pid,
+            args: json!({
+                "sourcePid": range.pid,
+                "sourceTid": range.tid,
+                "deviceId": device,
+            }),
             id: None,
             bp: None,
         })?;
         json_event_count += 1;
-        rows.push(TraceRow {
-            report: report.into(),
-            event_type: "nvtx".into(),
-            cat: "nvtx".into(),
-            name: range.name.clone(),
-            ph: "X".into(),
-            ts_us,
-            dur_us: Some(dur_us),
-            aligned_ts_us: ns_to_us(range.start - anchor_ns),
-            pid: pid_label,
-            tid: tid_label,
-            args_json: args.to_string(),
-            event_id: None,
-            launch_event_id: None,
-            stream_id: None,
-            correlation_id: None,
-            stream_sequence: None,
-            depends_on_event_id: None,
-            dependency_type: None,
-        });
+    }
 
-        for (&device, &(kernel_start, kernel_end)) in &range.kernel_bounds {
-            // Put the GPU-projected NVTX interval on the same source CPU thread
-            // as CUDA API and NVTX events. Hardware execution remains on streams.
-            let projected_pid = format!("Process {}", range.pid);
-            let projected_tid = format!("CUDA API / NVTX Thread {}", range.tid);
-            let projected_ts_us = ns_to_us(kernel_start - origin_ns);
-            let projected_dur_us = ns_to_us(kernel_end - kernel_start);
-            writer.event(&TraceEvent {
+    for range in nvtx {
+        let ts_us = ns_to_us(range.start - origin_ns);
+        let dur_us = ns_to_us(range.end - range.start);
+        let args = json!({"sourcePid": range.pid, "sourceTid": range.tid});
+        let range_devices: Vec<i64> = if range.kernel_bounds.is_empty() {
+            process_devices
+                .get(&range.pid)
+                .into_iter()
+                .flatten()
+                .copied()
+                .collect()
+        } else {
+            range.kernel_bounds.keys().copied().collect()
+        };
+        for device in range_devices {
+            let mut device_args = args.clone();
+            device_args["deviceId"] = json!(device);
+            rows.push(TraceRow {
+                report: report.into(),
+                event_type: "nvtx".into(),
+                cat: "nvtx".into(),
                 name: range.name.clone(),
                 ph: "X".into(),
-                cat: "nvtx-kernel".into(),
-                ts: projected_ts_us,
-                dur: Some(projected_dur_us),
-                tid: host_slice_tracks[&HostSliceKey::ProjectedNvtx(range_idx, device)],
-                pid: range.pid,
-                args: json!({"sourcePid": range.pid, "sourceTid": range.tid, "deviceId": device}),
-                id: None,
-                bp: None,
-            })?;
-            json_event_count += 1;
+                ts_us,
+                dur_us: Some(dur_us),
+                aligned_ts_us: ns_to_us(range.start - anchor_ns),
+                pid: format!("CUDA Device {device} / Source PID {}", range.pid),
+                tid: format!("NVTX Thread {}", range.tid),
+                args_json: device_args.to_string(),
+                event_id: None,
+                launch_event_id: None,
+                stream_id: None,
+                correlation_id: None,
+                stream_sequence: None,
+                depends_on_event_id: None,
+                dependency_type: None,
+            });
+        }
+
+        for (&device, &(kernel_start, kernel_end)) in &range.kernel_bounds {
+            let projected_ts_us = ns_to_us(kernel_start - origin_ns);
+            let projected_dur_us = ns_to_us(kernel_end - kernel_start);
             rows.push(TraceRow {
                 report: report.into(),
                 event_type: "nvtx_kernel".into(),
@@ -1336,8 +1512,8 @@ fn emit_outputs(
                 ts_us: projected_ts_us,
                 dur_us: Some(projected_dur_us),
                 aligned_ts_us: ns_to_us(kernel_start - anchor_ns),
-                pid: projected_pid,
-                tid: projected_tid,
+                pid: format!("CUDA Device {device} / Source PID {}", range.pid),
+                tid: format!("NVTX Kernel Thread {}", range.tid),
                 args_json:
                     json!({"sourcePid": range.pid, "sourceTid": range.tid, "deviceId": device})
                         .to_string(),
