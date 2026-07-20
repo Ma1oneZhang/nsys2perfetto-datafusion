@@ -17,6 +17,9 @@ use serde::Serialize;
 use serde_json::{Value, json};
 
 const GLOBAL_ID_RADIX: i64 = 0x1000000;
+const GPU_PROCESS_ID_BASE: i64 = 2_000_000_000;
+const LAUNCH_FLOW_ID_BASE: u64 = 1_u64 << 51;
+const STREAM_FLOW_ID_BASE: u64 = 2_u64 << 51;
 
 #[derive(Parser, Debug)]
 #[command(about = "Convert Nsight Parquet tables to Perfetto JSON with DataFusion")]
@@ -80,8 +83,8 @@ struct TraceEvent {
     ts: f64,
     #[serde(skip_serializing_if = "Option::is_none")]
     dur: Option<f64>,
-    tid: String,
-    pid: String,
+    tid: i64,
+    pid: i64,
     args: Value,
     #[serde(skip_serializing_if = "Option::is_none")]
     id: Option<u64>,
@@ -564,6 +567,11 @@ mod tests {
         assert_eq!(nvtx[0].kernel_bounds.get(&1), Some(&(25, 30)));
         assert_eq!(kernels[0].nvtx_regions, ["multi_gpu_range"]);
         assert_eq!(kernels[1].nvtx_regions, ["multi_gpu_range"]);
+
+        runtime[1].end = kernels[1].start + 10;
+        let flow_start = launch_flow_start_ns(&runtime[1], &kernels[1]);
+        assert!(flow_start >= runtime[1].start);
+        assert!(flow_start < kernels[1].start);
     }
 }
 
@@ -591,6 +599,14 @@ fn ns_to_us(ns: i64) -> f64 {
     ns as f64 / 1000.0
 }
 
+fn gpu_process_id(device: i64) -> i64 {
+    GPU_PROCESS_ID_BASE + device
+}
+
+fn launch_flow_start_ns(call: &RuntimeCall, kernel: &Kernel) -> i64 {
+    (call.end - 1).min(kernel.start - 1).max(call.start)
+}
+
 fn emit_outputs(
     report: &str,
     output_json: &Path,
@@ -605,11 +621,152 @@ fn emit_outputs(
     let mut dependencies = Vec::with_capacity(kernels.len());
     let mut json_event_count = 0usize;
 
+    let stream_keys: BTreeSet<(i64, i64, i64)> = kernels
+        .iter()
+        .map(|kernel| (kernel.device, kernel.context, kernel.stream))
+        .collect();
+    let stream_tracks: BTreeMap<(i64, i64, i64), i64> = stream_keys
+        .iter()
+        .enumerate()
+        .map(|(idx, &key)| (key, idx as i64 + 1))
+        .collect();
+    let projected_keys: BTreeSet<(i64, i64, i64)> = nvtx
+        .iter()
+        .flat_map(|range| {
+            range
+                .kernel_bounds
+                .keys()
+                .map(move |&device| (device, range.pid, range.tid))
+        })
+        .collect();
+    let projected_tracks: BTreeMap<(i64, i64, i64), i64> = projected_keys
+        .iter()
+        .enumerate()
+        .map(|(idx, &key)| (key, stream_tracks.len() as i64 + idx as i64 + 1))
+        .collect();
+    let gpu_devices: BTreeSet<i64> = kernels.iter().map(|kernel| kernel.device).collect();
+    let mut host_threads: BTreeSet<(i64, i64)> = runtime
+        .iter()
+        .filter(|call| call.event_id.is_some())
+        .map(|call| {
+            (
+                (call.global_tid / GLOBAL_ID_RADIX) % GLOBAL_ID_RADIX,
+                call.global_tid % GLOBAL_ID_RADIX,
+            )
+        })
+        .collect();
+    host_threads.extend(nvtx.iter().map(|range| (range.pid, range.tid)));
+    let host_processes: BTreeSet<i64> = host_threads.iter().map(|&(pid, _)| pid).collect();
+
+    for device in gpu_devices {
+        let pid = gpu_process_id(device);
+        for (name, args) in [
+            (
+                "process_name",
+                json!({"name": format!("CUDA HW Device {device}")}),
+            ),
+            (
+                "process_sort_index",
+                json!({"sort_index": -10_000 + device}),
+            ),
+        ] {
+            writer.event(&TraceEvent {
+                name: name.into(),
+                ph: "M".into(),
+                cat: "__metadata".into(),
+                ts: 0.0,
+                dur: None,
+                tid: 0,
+                pid,
+                args,
+                id: None,
+                bp: None,
+            })?;
+            json_event_count += 1;
+        }
+    }
+    for (&(device, context, stream), &tid) in &stream_tracks {
+        for (name, args) in [
+            (
+                "thread_name",
+                json!({"name": format!("CUDA HW Context {context} / Stream {stream}")}),
+            ),
+            ("thread_sort_index", json!({"sort_index": tid})),
+        ] {
+            writer.event(&TraceEvent {
+                name: name.into(),
+                ph: "M".into(),
+                cat: "__metadata".into(),
+                ts: 0.0,
+                dur: None,
+                tid,
+                pid: gpu_process_id(device),
+                args,
+                id: None,
+                bp: None,
+            })?;
+            json_event_count += 1;
+        }
+    }
+    for (&(device, source_pid, source_tid), &tid) in &projected_tracks {
+        writer.event(&TraceEvent {
+            name: "thread_name".into(),
+            ph: "M".into(),
+            cat: "__metadata".into(),
+            ts: 0.0,
+            dur: None,
+            tid,
+            pid: gpu_process_id(device),
+            args: json!({"name": format!("NVTX Kernel PID {source_pid} / Thread {source_tid}")}),
+            id: None,
+            bp: None,
+        })?;
+        json_event_count += 1;
+    }
+    for pid in host_processes {
+        for (name, args) in [
+            (
+                "process_name",
+                json!({"name": format!("CUDA Host Process {pid}")}),
+            ),
+            ("process_sort_index", json!({"sort_index": 10_000 + pid})),
+        ] {
+            writer.event(&TraceEvent {
+                name: name.into(),
+                ph: "M".into(),
+                cat: "__metadata".into(),
+                ts: 0.0,
+                dur: None,
+                tid: 0,
+                pid,
+                args,
+                id: None,
+                bp: None,
+            })?;
+            json_event_count += 1;
+        }
+    }
+    for (pid, tid) in host_threads {
+        writer.event(&TraceEvent {
+            name: "thread_name".into(),
+            ph: "M".into(),
+            cat: "__metadata".into(),
+            ts: 0.0,
+            dur: None,
+            tid,
+            pid,
+            args: json!({"name": format!("CUDA API / NVTX Thread {tid}")}),
+            id: None,
+            bp: None,
+        })?;
+        json_event_count += 1;
+    }
+
     for call in runtime.iter().filter(|call| call.event_id.is_some()) {
         let pid_number = (call.global_tid / GLOBAL_ID_RADIX) % GLOBAL_ID_RADIX;
         let tid_number = call.global_tid % GLOBAL_ID_RADIX;
-        let pid = format!("Process {pid_number}");
-        let tid = format!("CUDA API Thread {tid_number}");
+        let pid_label = format!("Process {pid_number}");
+        let tid_label = format!("CUDA API Thread {tid_number}");
         let event_id = call
             .event_id
             .as_ref()
@@ -619,6 +776,9 @@ fn emit_outputs(
         let args = json!({
             "correlationId": call.correlation,
             "eventId": event_id,
+            "cpuStartNs": call.start,
+            "cpuEndNs": call.end,
+            "cpuDurationNs": call.end - call.start,
         });
         writer.event(&TraceEvent {
             name: call.name.clone(),
@@ -626,8 +786,8 @@ fn emit_outputs(
             cat: "cuda_api".into(),
             ts: ts_us,
             dur: Some(dur_us),
-            tid: tid.clone(),
-            pid: pid.clone(),
+            tid: tid_number,
+            pid: pid_number,
             args: args.clone(),
             id: None,
             bp: None,
@@ -642,8 +802,8 @@ fn emit_outputs(
             ts_us,
             dur_us: Some(dur_us),
             aligned_ts_us: ns_to_us(call.start - anchor_ns),
-            pid,
-            tid,
+            pid: pid_label,
+            tid: tid_label,
             args_json: args.to_string(),
             event_id: Some(event_id.clone()),
             launch_event_id: None,
@@ -667,6 +827,9 @@ fn emit_outputs(
             "streamSequence": kernel.sequence,
             "eventId": kernel.event_id,
             "launchEventId": launch_event_id,
+            "gpuStartNs": kernel.start,
+            "gpuEndNs": kernel.end,
+            "gpuDurationNs": kernel.end - kernel.start,
             "dependsOnEventId": predecessor_id,
             "dependencyType": predecessor_id.as_ref().map(|_| "same_stream_order"),
             "grid": kernel.grid,
@@ -675,16 +838,18 @@ fn emit_outputs(
         });
         let ts_us = ns_to_us(kernel.start - origin_ns);
         let dur_us = ns_to_us(kernel.end - kernel.start);
-        let pid = format!("Device {}", kernel.device);
-        let tid = format!("Stream {}", kernel.stream);
+        let pid_label = format!("CUDA HW Device {}", kernel.device);
+        let tid_label = format!("Context {} / Stream {}", kernel.context, kernel.stream);
+        let gpu_pid = gpu_process_id(kernel.device);
+        let gpu_tid = stream_tracks[&(kernel.device, kernel.context, kernel.stream)];
         writer.event(&TraceEvent {
             name: kernel.name.clone(),
             ph: "X".into(),
             cat: "cuda".into(),
             ts: ts_us,
             dur: Some(dur_us),
-            tid: tid.clone(),
-            pid: pid.clone(),
+            tid: gpu_tid,
+            pid: gpu_pid,
             args: args.clone(),
             id: None,
             bp: None,
@@ -699,8 +864,8 @@ fn emit_outputs(
             ts_us,
             dur_us: Some(dur_us),
             aligned_ts_us: ns_to_us(kernel.start - anchor_ns),
-            pid: pid.clone(),
-            tid: tid.clone(),
+            pid: pid_label.clone(),
+            tid: tid_label.clone(),
             args_json: args.to_string(),
             event_id: Some(kernel.event_id.clone()),
             launch_event_id: launch_event_id.clone(),
@@ -719,22 +884,29 @@ fn emit_outputs(
                 .context("kernel launch call has no event ID")?;
             let call_pid = (call.global_tid / GLOBAL_ID_RADIX) % GLOBAL_ID_RADIX;
             let call_tid = call.global_tid % GLOBAL_ID_RADIX;
-            let flow_id = (1_u64 << 52) | kernel_idx as u64;
+            let flow_id = LAUNCH_FLOW_ID_BASE + kernel_idx as u64;
             let flow_args = json!({
                 "from": call_event_id,
                 "to": kernel.event_id,
                 "correlationId": kernel.correlation,
                 "deviceId": kernel.device,
                 "streamId": kernel.stream,
+                "cpuCallStartNs": call.start,
+                "cpuCallEndNs": call.end,
+                "gpuKernelStartNs": kernel.start,
+                "gpuKernelEndNs": kernel.end,
+                "launchLatencyUs": ns_to_us((kernel.start - call.end).max(0)),
+                "kernelStartMinusApiEndUs": ns_to_us(kernel.start - call.end),
             });
+            let flow_start_ns = launch_flow_start_ns(call, kernel);
             writer.event(&TraceEvent {
                 name: "cuda_kernel_launch".into(),
                 ph: "s".into(),
                 cat: "cuda_launch_dependency".into(),
-                ts: ns_to_us((call.end - 1).max(call.start) - origin_ns),
+                ts: ns_to_us(flow_start_ns - origin_ns),
                 dur: None,
-                tid: format!("CUDA API Thread {call_tid}"),
-                pid: format!("Process {call_pid}"),
+                tid: call_tid,
+                pid: call_pid,
                 args: flow_args.clone(),
                 id: Some(flow_id),
                 bp: None,
@@ -743,10 +915,10 @@ fn emit_outputs(
                 name: "cuda_kernel_launch".into(),
                 ph: "f".into(),
                 cat: "cuda_launch_dependency".into(),
-                ts: ns_to_us(kernel.start - origin_ns),
+                ts: ns_to_us((kernel.start + 1).min(kernel.end) - origin_ns),
                 dur: None,
-                tid: tid.clone(),
-                pid: pid.clone(),
+                tid: gpu_tid,
+                pid: gpu_pid,
                 args: flow_args,
                 id: Some(flow_id),
                 bp: Some("e".into()),
@@ -756,11 +928,9 @@ fn emit_outputs(
 
         if let Some(previous_idx) = kernel.predecessor {
             let previous = &kernels[previous_idx];
-            // Legacy Chrome/Perfetto flow IDs must be numeric. Keep the richer
-            // string event IDs in args and Parquet, but use this compact ID for s/f.
-            let flow_id = ((kernel.device as u64 & 0xffff) << 48)
-                | ((kernel.stream as u64 & 0xffff) << 32)
-                | (kernel.sequence & 0xffff_ffff);
+            // Keep flow IDs numeric and below 2^53 so JavaScript represents them
+            // exactly. Launch and stream dependencies use disjoint namespaces.
+            let flow_id = STREAM_FLOW_ID_BASE + kernel_idx as u64;
             let flow_args = json!({
                 "from": previous.event_id,
                 "to": kernel.event_id,
@@ -774,8 +944,8 @@ fn emit_outputs(
                 // slices are half-open, so binding at exactly `end` drops the flow.
                 ts: ns_to_us((previous.end - 1).max(previous.start) - origin_ns),
                 dur: None,
-                tid: format!("Stream {}", previous.stream),
-                pid: format!("Device {}", previous.device),
+                tid: stream_tracks[&(previous.device, previous.context, previous.stream)],
+                pid: gpu_process_id(previous.device),
                 args: flow_args.clone(),
                 id: Some(flow_id),
                 bp: None,
@@ -786,8 +956,8 @@ fn emit_outputs(
                 cat: "cuda_dependency".into(),
                 ts: ns_to_us(kernel.start - origin_ns),
                 dur: None,
-                tid: tid.clone(),
-                pid: pid.clone(),
+                tid: gpu_tid,
+                pid: gpu_pid,
                 args: flow_args,
                 id: Some(flow_id),
                 bp: Some("e".into()),
@@ -812,8 +982,8 @@ fn emit_outputs(
     }
 
     for range in nvtx {
-        let pid = format!("Process {}", range.pid);
-        let tid = format!("NVTX Thread {}", range.tid);
+        let pid_label = format!("Process {}", range.pid);
+        let tid_label = format!("NVTX Thread {}", range.tid);
         let ts_us = ns_to_us(range.start - origin_ns);
         let dur_us = ns_to_us(range.end - range.start);
         let args = json!({"sourcePid": range.pid, "sourceTid": range.tid});
@@ -823,8 +993,8 @@ fn emit_outputs(
             cat: "nvtx".into(),
             ts: ts_us,
             dur: Some(dur_us),
-            tid: tid.clone(),
-            pid: pid.clone(),
+            tid: range.tid,
+            pid: range.pid,
             args: args.clone(),
             id: None,
             bp: None,
@@ -839,8 +1009,8 @@ fn emit_outputs(
             ts_us,
             dur_us: Some(dur_us),
             aligned_ts_us: ns_to_us(range.start - anchor_ns),
-            pid: pid.clone(),
-            tid,
+            pid: pid_label,
+            tid: tid_label,
             args_json: args.to_string(),
             event_id: None,
             launch_event_id: None,
@@ -852,8 +1022,9 @@ fn emit_outputs(
         });
 
         for (&device, &(kernel_start, kernel_end)) in &range.kernel_bounds {
-            let projected_pid = format!("Device {device}");
+            let projected_pid = format!("CUDA HW Device {device}");
             let projected_tid = format!("NVTX Kernel Thread {}", range.tid);
+            let projected_track_tid = projected_tracks[&(device, range.pid, range.tid)];
             let projected_ts_us = ns_to_us(kernel_start - origin_ns);
             let projected_dur_us = ns_to_us(kernel_end - kernel_start);
             writer.event(&TraceEvent {
@@ -862,8 +1033,8 @@ fn emit_outputs(
                 cat: "nvtx-kernel".into(),
                 ts: projected_ts_us,
                 dur: Some(projected_dur_us),
-                tid: projected_tid.clone(),
-                pid: projected_pid.clone(),
+                tid: projected_track_tid,
+                pid: gpu_process_id(device),
                 args: json!({"sourcePid": range.pid, "sourceTid": range.tid, "deviceId": device}),
                 id: None,
                 bp: None,
