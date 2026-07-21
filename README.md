@@ -8,6 +8,8 @@ The converter reads Parquet with Apache DataFusion and does not use SQLite.
 
 - CUDA kernel slices with device, context, stream, correlation, grid, and block metadata
 - CPU CUDA Runtime launch slices linked to GPU kernel execution with Perfetto flows
+- Visible `cudaDeviceSynchronize` and `cudaStreamSynchronize` Runtime slices,
+  including versioned and per-thread-default-stream API variants
 - H2D, D2H, and D2D memcpy slices with byte count, memory kinds, bandwidth,
   source/destination device/context details, and API-to-copy flows
 - Memcpy remains visible on its CUDA HW context/stream and is also projected to

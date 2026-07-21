@@ -78,6 +78,36 @@ pub(super) fn link_runtime_calls_to_gpu_activities(
     (kernel_links, memcpy_links)
 }
 
+fn is_cuda_sync_api(name: &str) -> bool {
+    ["cudaDeviceSynchronize", "cudaStreamSynchronize"]
+        .into_iter()
+        .any(|prefix| {
+            name == prefix
+                || name
+                    .strip_prefix(prefix)
+                    .is_some_and(|suffix| suffix.starts_with('_'))
+        })
+}
+
+pub(super) fn mark_cuda_sync_calls(report: &str, runtime: &mut [RuntimeCall]) -> usize {
+    let mut sync_calls = 0;
+    for (call_idx, call) in runtime.iter_mut().enumerate() {
+        if !is_cuda_sync_api(&call.name) {
+            continue;
+        }
+        sync_calls += 1;
+        if call.event_id.is_none() {
+            let pid = source_pid(call.global_tid);
+            let tid = call.global_tid % GLOBAL_ID_RADIX;
+            call.event_id = Some(format!(
+                "{report}:cuda_api_sync:{pid}:{tid}:{}:{call_idx}",
+                call.correlation
+            ));
+        }
+    }
+    sync_calls
+}
+
 pub(super) fn project_nvtx_to_kernels(
     kernels: &mut [Kernel],
     nvtx: &mut [NvtxRange],
@@ -476,5 +506,40 @@ mod tests {
 
         assert_eq!(assignments.len(), 4);
         assert_eq!(assignments, vec![(0, 0), (1, 1), (2, 1), (3, 0)]);
+    }
+
+    #[test]
+    fn marks_device_and_stream_synchronization_calls_as_visible() {
+        let mut runtime = vec![
+            RuntimeCall {
+                start: 10,
+                end: 20,
+                global_tid: 7 * GLOBAL_ID_RADIX + 11,
+                correlation: 1,
+                name: "cudaDeviceSynchronize".into(),
+                event_id: None,
+            },
+            RuntimeCall {
+                start: 30,
+                end: 40,
+                global_tid: 7 * GLOBAL_ID_RADIX + 11,
+                correlation: 2,
+                name: "cudaStreamSynchronize_ptsz".into(),
+                event_id: None,
+            },
+            RuntimeCall {
+                start: 50,
+                end: 60,
+                global_tid: 7 * GLOBAL_ID_RADIX + 11,
+                correlation: 3,
+                name: "cudaLaunchKernel".into(),
+                event_id: None,
+            },
+        ];
+
+        assert_eq!(mark_cuda_sync_calls("report", &mut runtime), 2);
+        assert!(runtime[0].event_id.is_some());
+        assert!(runtime[1].event_id.is_some());
+        assert!(runtime[2].event_id.is_none());
     }
 }

@@ -231,7 +231,11 @@ pub(super) fn emit_outputs(
     }
     for (call_idx, call) in runtime.iter().enumerate() {
         if call.event_id.is_some() && !call_devices.contains_key(&call_idx) {
-            call_devices.entry(call_idx).or_default().insert(-1);
+            let pid = source_pid(call.global_tid);
+            call_devices
+                .entry(call_idx)
+                .or_default()
+                .extend(process_devices[&pid].iter().copied());
         }
     }
     // Place CUDA API tracks under each CUDA device process. Complete CUDA API

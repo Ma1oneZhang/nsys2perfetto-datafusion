@@ -209,6 +209,7 @@ async fn main() -> Result<()> {
         &mut memcpys,
         &mut runtime,
     );
+    let cuda_sync_api_count = mark_cuda_sync_calls(&args.report, &mut runtime);
     if kernels.is_empty() && memcpys.is_empty() {
         for (call_idx, call) in runtime.iter_mut().enumerate() {
             let pid = source_pid(call.global_tid);
@@ -291,10 +292,11 @@ async fn main() -> Result<()> {
     .await?;
 
     println!(
-        "report={} kernels={} cuda_api={} launch_dependencies={} core_launch_dependencies={} memcpy={} h2d={} d2h={} d2d={} memcpy_launch_dependencies={} pcie_usage_launch_dependencies={} nvtx={} nvtx_kernel={} stream_dependencies={} json_events={} parquet_rows={} anchor_ns={} alignment_anchor={}",
+        "report={} kernels={} cuda_api={} cuda_sync_api={} launch_dependencies={} core_launch_dependencies={} memcpy={} h2d={} d2h={} d2d={} memcpy_launch_dependencies={} pcie_usage_launch_dependencies={} nvtx={} nvtx_kernel={} stream_dependencies={} json_events={} parquet_rows={} anchor_ns={} alignment_anchor={}",
         args.report,
         kernels.len(),
         cuda_api_count,
+        cuda_sync_api_count,
         launch_dependencies,
         launch_dependencies,
         memcpys.len(),
