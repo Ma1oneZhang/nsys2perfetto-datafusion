@@ -328,6 +328,38 @@ pub(super) fn allocate_interval_lanes<K: Copy + Ord>(
         .collect()
 }
 
+/// Allocate lanes for begin/end events while retaining all hierarchy that can
+/// be represented by a stack. Nested and disjoint intervals share a lane;
+/// partially crossing intervals move to an adjacent lane.
+pub(super) fn allocate_laminar_lanes<K: Copy + Ord>(
+    intervals: &mut [(i64, i64, K)],
+) -> Vec<(K, usize)> {
+    intervals.sort_unstable_by(|a, b| {
+        (a.0, std::cmp::Reverse(a.1), a.2).cmp(&(b.0, std::cmp::Reverse(b.1), b.2))
+    });
+
+    let mut lane_stacks: Vec<Vec<i64>> = Vec::new();
+    intervals
+        .iter()
+        .map(|&(start, end, key)| {
+            let lane = lane_stacks
+                .iter_mut()
+                .position(|stack| {
+                    while stack.last().is_some_and(|&active_end| active_end <= start) {
+                        stack.pop();
+                    }
+                    stack.last().is_none_or(|&parent_end| end <= parent_end)
+                })
+                .unwrap_or_else(|| {
+                    lane_stacks.push(Vec::new());
+                    lane_stacks.len() - 1
+                });
+            lane_stacks[lane].push(end);
+            (key, lane)
+        })
+        .collect()
+}
+
 pub(super) fn resolve_device_assignments(
     kernels: &[Kernel],
     memcpys: &[Memcpy],
@@ -506,6 +538,29 @@ mod tests {
 
         assert_eq!(assignments.len(), 4);
         assert_eq!(assignments, vec![(0, 0), (1, 1), (2, 1), (3, 0)]);
+    }
+
+    #[test]
+    fn keeps_nested_intervals_together_and_separates_partial_crossings() {
+        let mut intervals = vec![
+            (0, 10, "outer"),
+            (2, 5, "nested"),
+            (4, 12, "crossing"),
+            (12, 15, "disjoint"),
+            (0, 8, "same_start_inner"),
+        ];
+        let assignments = allocate_laminar_lanes(&mut intervals);
+
+        assert_eq!(
+            assignments,
+            vec![
+                ("outer", 0),
+                ("same_start_inner", 0),
+                ("nested", 0),
+                ("crossing", 1),
+                ("disjoint", 0),
+            ]
+        );
     }
 
     #[test]

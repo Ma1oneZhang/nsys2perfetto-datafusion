@@ -106,12 +106,52 @@ enum DeviceTrackKind {
     Nvtx,
 }
 
-type KernelUsageIntervals = BTreeMap<(i64, i64), Vec<(i64, i64, usize)>>;
-type DeviceIntervals = BTreeMap<(i64, i64, DeviceTrackKind, i64), Vec<(i64, i64, DeviceSliceKey)>>;
+#[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+enum StreamSliceKey {
+    Kernel(usize),
+    Memcpy(usize),
+}
 
-pub(super) fn emit_outputs(
-    input: EmitInput<'_>,
-) -> Result<(Vec<TraceRow>, Vec<DependencyRow>, usize, usize)> {
+#[derive(Clone, Copy)]
+enum FlowKind {
+    Kernel = 1,
+    Memcpy = 2,
+    Core = 3,
+    PcieUsage = 4,
+}
+
+type KernelUsageIntervals = BTreeMap<(i64, i64), Vec<(i64, i64, usize)>>;
+type StreamIntervals = BTreeMap<(i64, i64, i64, i64), Vec<(i64, i64, StreamSliceKey)>>;
+type DeviceIntervals = BTreeMap<(i64, i64, DeviceTrackKind, i64), Vec<(i64, i64, DeviceSliceKey)>>;
+type ProjectedNvtxIntervals = BTreeMap<(i64, i64, i64), Vec<(i64, i64, DeviceSliceKey)>>;
+
+pub(super) struct EmitResult {
+    pub(super) trace_rows: Vec<TraceRow>,
+    pub(super) dependencies: Vec<DependencyRow>,
+    pub(super) json_event_count: usize,
+    pub(super) pcie_usage_launch_dependencies: usize,
+    pub(super) stream_overlap_lanes: usize,
+    pub(super) projected_nvtx_overlap_lanes: usize,
+}
+
+fn flow_id(report: &str, kind: FlowKind, index: usize) -> u64 {
+    // Keep the low 32 bits collision-free within one report/kind and namespace
+    // the high 31 bits so independently converted reports can be safely merged
+    // while every numeric ID remains in Perfetto's signed 64-bit range.
+    let index = u32::try_from(index).expect("flow index exceeds u32::MAX");
+    let mut namespace = 0x811c9dc5_u32;
+    for byte in report.bytes().chain([0, kind as u8]) {
+        namespace ^= u32::from(byte);
+        namespace = namespace.wrapping_mul(0x01000193);
+    }
+    namespace &= i32::MAX as u32;
+    if namespace == 0 {
+        namespace = i32::MAX as u32;
+    }
+    (u64::from(namespace) << 32) | u64::from(index)
+}
+
+pub(super) fn emit_outputs(input: EmitInput<'_>) -> Result<EmitResult> {
     let EmitInput {
         report,
         output_json,
@@ -129,6 +169,8 @@ pub(super) fn emit_outputs(
     let dependencies = Vec::new();
     let mut json_event_count = 0usize;
     let mut pcie_usage_launch_dependencies = 0usize;
+    let mut stream_overlap_lanes = 0usize;
+    let mut projected_nvtx_overlap_lanes = 0usize;
 
     // A CUDA device ID is process-local. Keep the source process in every GPU
     // track key so two processes' device 0 never collapse onto one device.
@@ -148,30 +190,55 @@ pub(super) fn emit_outputs(
         .enumerate()
         .map(|(idx, &key)| (key, GPU_PROCESS_ID_BASE + idx as i64))
         .collect();
-    let stream_keys: BTreeSet<(i64, i64, i64, i64)> = kernels
-        .iter()
-        .map(|kernel| {
-            (
+    // CUPTI may report tiny overlaps between activities on the same logical
+    // stream. Perfetto rejects overlapping complete events on one track, so
+    // preserve every raw interval and move only the overlap to adjacent lanes.
+    let mut stream_intervals = StreamIntervals::new();
+    for (kernel_idx, kernel) in kernels.iter().enumerate() {
+        stream_intervals
+            .entry((
                 source_pid(kernel.global_pid),
                 kernel.device,
                 kernel.context,
                 kernel.stream,
-            )
-        })
-        .chain(memcpys.iter().zip(&memcpy_devices).map(|(copy, devices)| {
-            (
+            ))
+            .or_default()
+            .push((kernel.start, kernel.end, StreamSliceKey::Kernel(kernel_idx)));
+    }
+    for (copy_idx, (copy, devices)) in memcpys.iter().zip(&memcpy_devices).enumerate() {
+        stream_intervals
+            .entry((
                 source_pid(copy.global_pid),
                 primary_copy_device(copy, devices),
                 copy.context,
                 copy.stream,
-            )
-        }))
-        .collect();
-    let stream_tracks: BTreeMap<(i64, i64, i64, i64), i64> = stream_keys
-        .iter()
-        .enumerate()
-        .map(|(idx, &key)| (key, idx as i64 + 1))
-        .collect();
+            ))
+            .or_default()
+            .push((copy.start, copy.end, StreamSliceKey::Memcpy(copy_idx)));
+    }
+    let mut stream_slice_tracks = BTreeMap::new();
+    let mut stream_track_metadata = Vec::new();
+    let mut next_stream_track = 1_i64;
+    for (&(pid, device, context, stream), intervals) in &mut stream_intervals {
+        let assignments = allocate_interval_lanes(intervals);
+        let lane_count = assignments
+            .iter()
+            .map(|&(_, lane)| lane + 1)
+            .max()
+            .unwrap_or(0);
+        stream_overlap_lanes += lane_count.saturating_sub(1);
+        let lane_tids = (0..lane_count)
+            .map(|lane| {
+                let tid = next_stream_track;
+                next_stream_track += 1;
+                stream_track_metadata.push((pid, device, context, stream, tid, lane));
+                tid
+            })
+            .collect::<Vec<_>>();
+        for (key, lane) in assignments {
+            stream_slice_tracks.insert(key, lane_tids[lane]);
+        }
+    }
     let copy_track_keys: BTreeSet<(i64, i64, &'static str)> = memcpys
         .iter()
         .zip(&memcpy_devices)
@@ -260,36 +327,44 @@ pub(super) fn emit_outputs(
     }
     let mut device_slice_tracks = BTreeMap::new();
     let mut device_track_metadata = Vec::new();
-    let projected_track_keys: BTreeSet<(i64, i64, i64)> = nvtx
-        .iter()
-        .flat_map(|range| {
-            range
-                .kernel_bounds
-                .keys()
-                .map(move |&device| (range.pid, device, range.tid))
-        })
-        .collect();
-    let projected_tracks: BTreeMap<(i64, i64, i64), i64> = projected_track_keys
-        .iter()
-        .enumerate()
-        .map(|(idx, &key)| (key, 1_000_000_000_i64 + idx as i64))
-        .collect();
-    for (&(pid, device, source_tid), &tid) in &projected_tracks {
-        device_track_metadata.push((
-            pid,
-            device,
-            DeviceTrackKind::ProjectedNvtx,
-            tid,
-            source_tid,
-            None,
-        ));
-    }
+    // Kernel envelopes of otherwise nested NVTX ranges can partially cross.
+    // Such intervals cannot be represented by one B/E stack, so keep nested
+    // ranges together and place only partial crossings on adjacent lanes.
+    let mut projected_nvtx_intervals = ProjectedNvtxIntervals::new();
     for (range_idx, range) in nvtx.iter().enumerate() {
-        for &device in range.kernel_bounds.keys() {
-            device_slice_tracks.insert(
-                DeviceSliceKey::ProjectedNvtx(range_idx, device),
-                projected_tracks[&(range.pid, device, range.tid)],
-            );
+        for (&device, &(start, end)) in &range.kernel_bounds {
+            projected_nvtx_intervals
+                .entry((range.pid, device, range.tid))
+                .or_default()
+                .push((start, end, DeviceSliceKey::ProjectedNvtx(range_idx, device)));
+        }
+    }
+    let mut next_projected_nvtx_track = 1_000_000_000_i64;
+    for (&(pid, device, source_tid), intervals) in &mut projected_nvtx_intervals {
+        let assignments = allocate_laminar_lanes(intervals);
+        let lane_count = assignments
+            .iter()
+            .map(|&(_, lane)| lane + 1)
+            .max()
+            .unwrap_or(0);
+        projected_nvtx_overlap_lanes += lane_count.saturating_sub(1);
+        let lane_tids = (0..lane_count)
+            .map(|lane| {
+                let tid = next_projected_nvtx_track;
+                next_projected_nvtx_track += 1;
+                device_track_metadata.push((
+                    pid,
+                    device,
+                    DeviceTrackKind::ProjectedNvtx,
+                    tid,
+                    source_tid,
+                    (lane_count > 1).then_some(lane),
+                ));
+                tid
+            })
+            .collect::<Vec<_>>();
+        for (key, lane) in assignments {
+            device_slice_tracks.insert(key, lane_tids[lane]);
         }
     }
 
@@ -393,12 +468,17 @@ pub(super) fn emit_outputs(
             json_event_count += 1;
         }
     }
-    for (&(source_pid, device, context, stream), &tid) in &stream_tracks {
+    for &(source_pid, device, context, stream, tid, lane) in &stream_track_metadata {
+        let track_name = if lane == 0 {
+            format!("CUDA HW Context {context} / Stream {stream}")
+        } else {
+            format!(
+                "CUDA HW Context {context} / Stream {stream} / Lane {}",
+                lane + 1
+            )
+        };
         for (name, args) in [
-            (
-                "thread_name",
-                json!({"name": format!("CUDA HW Context {context} / Stream {stream}")}),
-            ),
+            ("thread_name", json!({"name": track_name})),
             ("thread_sort_index", json!({"sort_index": tid})),
         ] {
             writer.event(&TraceEvent {
@@ -619,12 +699,7 @@ pub(super) fn emit_outputs(
         );
         let tid_label = format!("Context {} / Stream {}", kernel.context, kernel.stream);
         let gpu_pid = gpu_processes[&(kernel_source_pid, kernel.device)];
-        let gpu_tid = stream_tracks[&(
-            kernel_source_pid,
-            kernel.device,
-            kernel.context,
-            kernel.stream,
-        )];
+        let gpu_tid = stream_slice_tracks[&StreamSliceKey::Kernel(kernel_idx)];
         writer.event(&TraceEvent {
             name: kernel.name.clone(),
             ph: "X".into(),
@@ -686,7 +761,7 @@ pub(super) fn emit_outputs(
                 .context("kernel launch call has no event ID")?;
             let call_pid = gpu_pid;
             let call_tid = device_slice_tracks[&DeviceSliceKey::Runtime(call_idx, kernel.device)];
-            let flow_id = LAUNCH_FLOW_ID_BASE + kernel_idx as u64;
+            let launch_flow_id = flow_id(report, FlowKind::Kernel, kernel_idx);
             let flow_args = json!({
                 "from": call_event_id,
                 "to": kernel.event_id,
@@ -710,7 +785,7 @@ pub(super) fn emit_outputs(
                 tid: call_tid,
                 pid: call_pid,
                 args: flow_args.clone(),
-                id: Some(flow_id),
+                id: Some(launch_flow_id),
                 bp: None,
             })?;
             writer.event(&TraceEvent {
@@ -722,10 +797,10 @@ pub(super) fn emit_outputs(
                 tid: gpu_tid,
                 pid: gpu_pid,
                 args: flow_args.clone(),
-                id: Some(flow_id),
+                id: Some(launch_flow_id),
                 bp: Some("e".into()),
             })?;
-            let core_flow_id = CORE_LAUNCH_FLOW_ID_BASE + kernel_idx as u64;
+            let core_flow_id = flow_id(report, FlowKind::Core, kernel_idx);
             let mut core_flow_args = flow_args.clone();
             core_flow_args["targetTrack"] = json!("CUDA Core Timeline");
             writer.event(&TraceEvent {
@@ -761,7 +836,7 @@ pub(super) fn emit_outputs(
         let primary_device = primary_copy_device(copy, devices);
         let track_name = copy_track_name(copy.copy_kind);
         let gpu_pid = gpu_processes[&(copy_source_pid, primary_device)];
-        let gpu_tid = stream_tracks[&(copy_source_pid, primary_device, copy.context, copy.stream)];
+        let gpu_tid = stream_slice_tracks[&StreamSliceKey::Memcpy(copy_idx)];
         let direction = copy_direction(copy.copy_kind);
         let duration_ns = copy.end - copy.start;
         let bandwidth_gbps = if duration_ns > 0 {
@@ -854,7 +929,7 @@ pub(super) fn emit_outputs(
                 .context("memcpy API call has no event ID")?;
             let call_pid = gpu_pid;
             let call_tid = device_slice_tracks[&DeviceSliceKey::Runtime(call_idx, primary_device)];
-            let flow_id = MEMCPY_FLOW_ID_BASE + copy_idx as u64;
+            let memcpy_flow_id = flow_id(report, FlowKind::Memcpy, copy_idx);
             let flow_args = json!({
                 "from": call_event_id, "to": copy.event_id, "direction": direction,
                 "correlationId": copy.correlation, "deviceId": primary_device,
@@ -875,7 +950,7 @@ pub(super) fn emit_outputs(
                 tid: call_tid,
                 pid: call_pid,
                 args: flow_args.clone(),
-                id: Some(flow_id),
+                id: Some(memcpy_flow_id),
                 bp: None,
             })?;
             writer.event(&TraceEvent {
@@ -890,7 +965,7 @@ pub(super) fn emit_outputs(
                 tid: gpu_tid,
                 pid: gpu_pid,
                 args: flow_args.clone(),
-                id: Some(flow_id),
+                id: Some(memcpy_flow_id),
                 bp: Some("e".into()),
             })?;
             json_event_count += 2;
@@ -898,7 +973,7 @@ pub(super) fn emit_outputs(
             if is_pcie_copy(copy.copy_kind) {
                 for &device in devices {
                     let pcie_flow_id =
-                        PCIE_USAGE_FLOW_ID_BASE + pcie_usage_launch_dependencies as u64;
+                        flow_id(report, FlowKind::PcieUsage, pcie_usage_launch_dependencies);
                     let mut pcie_flow_args = flow_args.clone();
                     pcie_flow_args["deviceId"] = json!(device);
                     pcie_flow_args["targetTrack"] = json!("PCIe Usage");
@@ -1086,10 +1161,29 @@ pub(super) fn emit_outputs(
         }
     }
     writer.finish()?;
-    Ok((
-        rows,
+    Ok(EmitResult {
+        trace_rows: rows,
         dependencies,
         json_event_count,
         pcie_usage_launch_dependencies,
-    ))
+        stream_overlap_lanes,
+        projected_nvtx_overlap_lanes,
+    })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn flow_ids_are_stable_report_scoped_and_locally_unique() {
+        let first = flow_id("rank-0", FlowKind::Kernel, 42);
+
+        assert_eq!(first, flow_id("rank-0", FlowKind::Kernel, 42));
+        assert_ne!(first, flow_id("rank-1", FlowKind::Kernel, 42));
+        assert_ne!(first, flow_id("rank-0", FlowKind::Core, 42));
+        assert_ne!(first, flow_id("rank-0", FlowKind::Kernel, 43));
+        assert_eq!(first as u32, 42);
+        assert!(first <= i64::MAX as u64);
+    }
 }

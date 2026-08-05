@@ -30,10 +30,6 @@ use serde_json::{Value, json};
 
 const GLOBAL_ID_RADIX: i64 = 0x1000000;
 const GPU_PROCESS_ID_BASE: i64 = 2_000_000_000;
-const LAUNCH_FLOW_ID_BASE: u64 = 1_u64 << 51;
-const MEMCPY_FLOW_ID_BASE: u64 = 2_u64 << 51;
-const CORE_LAUNCH_FLOW_ID_BASE: u64 = 3_u64 << 51;
-const PCIE_USAGE_FLOW_ID_BASE: u64 = 4_u64 << 51;
 
 #[derive(Parser, Debug)]
 #[command(about = "Convert Nsight Parquet tables to Perfetto JSON with DataFusion")]
@@ -254,17 +250,23 @@ async fn main() -> Result<()> {
     };
 
     let projected_nvtx: usize = nvtx.iter().map(|n| n.kernel_bounds.len()).sum();
-    let (trace_rows, dependencies, json_events, pcie_usage_launch_dependencies) =
-        emit_outputs(EmitInput {
-            report: &args.report,
-            output_json: &args.output_json,
-            kernels: &kernels,
-            memcpys: &memcpys,
-            runtime: &runtime,
-            nvtx: &nvtx,
-            origin_ns,
-            anchor_ns,
-        })?;
+    let EmitResult {
+        trace_rows,
+        dependencies,
+        json_event_count: json_events,
+        pcie_usage_launch_dependencies,
+        stream_overlap_lanes,
+        projected_nvtx_overlap_lanes,
+    } = emit_outputs(EmitInput {
+        report: &args.report,
+        output_json: &args.output_json,
+        kernels: &kernels,
+        memcpys: &memcpys,
+        runtime: &runtime,
+        nvtx: &nvtx,
+        origin_ns,
+        anchor_ns,
+    })?;
     let trace_row_count = trace_rows.len();
     let cuda_api_count = runtime
         .iter()
@@ -292,7 +294,7 @@ async fn main() -> Result<()> {
     .await?;
 
     println!(
-        "report={} kernels={} cuda_api={} cuda_sync_api={} launch_dependencies={} core_launch_dependencies={} memcpy={} h2d={} d2h={} d2d={} memcpy_launch_dependencies={} pcie_usage_launch_dependencies={} nvtx={} nvtx_kernel={} stream_dependencies={} json_events={} parquet_rows={} anchor_ns={} alignment_anchor={}",
+        "report={} kernels={} cuda_api={} cuda_sync_api={} launch_dependencies={} core_launch_dependencies={} memcpy={} h2d={} d2h={} d2d={} memcpy_launch_dependencies={} pcie_usage_launch_dependencies={} nvtx={} nvtx_kernel={} stream_overlap_lanes={} projected_nvtx_overlap_lanes={} stream_dependencies={} json_events={} parquet_rows={} anchor_ns={} alignment_anchor={}",
         args.report,
         kernels.len(),
         cuda_api_count,
@@ -307,6 +309,8 @@ async fn main() -> Result<()> {
         pcie_usage_launch_dependencies,
         nvtx.len(),
         projected_nvtx,
+        stream_overlap_lanes,
+        projected_nvtx_overlap_lanes,
         dependency_count,
         json_events,
         trace_row_count,
