@@ -25,11 +25,15 @@ The converter reads Parquet with Apache DataFusion and does not use SQLite.
   D2D remains excluded from PCIe flows
 - Explicit per-source-process `CUDA HW deviceId` tracks with context/stream lanes showing
   the CUPTI kernel start, end, and duration
+- Overlap-safe CUDA HW context/stream lanes preserve raw CUPTI intervals even
+  when legacy instrumentation reports slightly crossing complete events
 - NVTX push/pop ranges and NVTX-to-kernel projection using CUDA Runtime overlap
 - Device-centric Perfetto hierarchy: every CUDA device contains its HW
   context/stream, NVTX Kernel, CUDA API, and NVTX Thread child tracks
 - NVTX and projected NVTX emitted as timestamp-sorted begin/end stacks so
   Perfetto preserves their push/pop parent-child hierarchy
+- Projected NVTX keeps nested ranges on one stack and moves only partially
+  crossing kernel envelopes to adjacent lanes
 - Overlap-safe CUDA API lanes so Perfetto drops no complete-event slices
 - Tracks with the same source thread ID grouped as NVTX Kernel, NVTX Thread,
   then CUDA API
@@ -80,7 +84,9 @@ Open the JSON or JSON gzip directly at [ui.perfetto.dev](https://ui.perfetto.dev
 The `.json.gz` is a single compressed JSON stream, not an archive, and contains
 no Parquet output. The JSON uses
 Chrome Trace Event format and emits `s`/`f` flow pairs with numeric IDs so the
-dependency arrows are accepted by Perfetto.
+dependency arrows are accepted by Perfetto. Flow IDs are namespaced by the
+report name, preventing duplicate flow starts when traces from distinct reports
+are merged.
 
 Every matched kernel launch emits a `cuda_launch_dependency` flow from the CPU
 CUDA Runtime API slice to the corresponding GPU kernel. Matching uses the
