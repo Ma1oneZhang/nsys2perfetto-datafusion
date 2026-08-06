@@ -52,6 +52,8 @@ struct TableAvailability {
     memcpy: bool,
     nvtx: bool,
     strings: bool,
+    gpu_metrics: bool,
+    gpu_metric_info: bool,
 }
 
 #[derive(Debug)]
@@ -116,6 +118,17 @@ struct NvtxRange {
     kernel_bounds: BTreeMap<i64, (i64, i64)>,
 }
 
+#[derive(Debug)]
+struct GpuMetric {
+    timestamp: i64,
+    type_id: i64,
+    device: i64,
+    metric_id: i64,
+    name: String,
+    value: i64,
+    unit: Option<String>,
+}
+
 struct TraceRow {
     report: String,
     event_type: String,
@@ -135,6 +148,10 @@ struct TraceRow {
     stream_sequence: Option<u64>,
     depends_on_event_id: Option<String>,
     dependency_type: Option<String>,
+    device_id: Option<i64>,
+    metric_id: Option<u32>,
+    metric_value: Option<i64>,
+    metric_unit: Option<String>,
 }
 
 struct DependencyRow {
@@ -199,6 +216,16 @@ async fn main() -> Result<()> {
     } else {
         Vec::new()
     };
+    let gpu_metrics = if tables.gpu_metrics && tables.gpu_metric_info {
+        load_gpu_metrics(&ctx).await?
+    } else {
+        if tables.gpu_metrics != tables.gpu_metric_info {
+            eprintln!(
+                "warning: GPU_METRICS.parquet and TARGET_INFO_GPU_METRICS.parquet must both be present; GPU metrics are omitted"
+            );
+        }
+        Vec::new()
+    };
     let (launch_dependencies, memcpy_launch_dependencies) = link_runtime_calls_to_gpu_activities(
         &args.report,
         &mut kernels,
@@ -230,8 +257,9 @@ async fn main() -> Result<()> {
                 .filter(|call| call.event_id.is_some())
                 .map(|call| call.start),
         )
+        .chain(gpu_metrics.iter().map(|metric| metric.timestamp))
         .min()
-        .context("trace contains no CUDA kernel, memcpy, linked API, or NVTX ranges")?;
+        .context("trace contains no CUDA kernel, memcpy, linked API, NVTX range, or GPU metric")?;
     let measured_batch_anchor = nvtx
         .iter()
         .filter(|n| {
@@ -264,6 +292,7 @@ async fn main() -> Result<()> {
         memcpys: &memcpys,
         runtime: &runtime,
         nvtx: &nvtx,
+        gpu_metrics: &gpu_metrics,
         origin_ns,
         anchor_ns,
     })?;
@@ -294,7 +323,7 @@ async fn main() -> Result<()> {
     .await?;
 
     println!(
-        "report={} kernels={} cuda_api={} cuda_sync_api={} launch_dependencies={} core_launch_dependencies={} memcpy={} h2d={} d2h={} d2d={} memcpy_launch_dependencies={} pcie_usage_launch_dependencies={} nvtx={} nvtx_kernel={} stream_overlap_lanes={} projected_nvtx_overlap_lanes={} stream_dependencies={} json_events={} parquet_rows={} anchor_ns={} alignment_anchor={}",
+        "report={} kernels={} cuda_api={} cuda_sync_api={} launch_dependencies={} core_launch_dependencies={} memcpy={} h2d={} d2h={} d2d={} memcpy_launch_dependencies={} pcie_usage_launch_dependencies={} nvtx={} nvtx_kernel={} gpu_metric_devices={} gpu_metric_series={} gpu_metric_samples={} stream_overlap_lanes={} projected_nvtx_overlap_lanes={} stream_dependencies={} json_events={} parquet_rows={} anchor_ns={} alignment_anchor={}",
         args.report,
         kernels.len(),
         cuda_api_count,
@@ -309,6 +338,17 @@ async fn main() -> Result<()> {
         pcie_usage_launch_dependencies,
         nvtx.len(),
         projected_nvtx,
+        gpu_metrics
+            .iter()
+            .map(|metric| metric.device)
+            .collect::<BTreeSet<_>>()
+            .len(),
+        gpu_metrics
+            .iter()
+            .map(|metric| (metric.type_id, metric.metric_id))
+            .collect::<BTreeSet<_>>()
+            .len(),
+        gpu_metrics.len(),
         stream_overlap_lanes,
         projected_nvtx_overlap_lanes,
         dependency_count,

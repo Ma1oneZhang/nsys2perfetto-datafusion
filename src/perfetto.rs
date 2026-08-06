@@ -88,6 +88,7 @@ pub(super) struct EmitInput<'a> {
     pub(super) memcpys: &'a [Memcpy],
     pub(super) runtime: &'a [RuntimeCall],
     pub(super) nvtx: &'a [NvtxRange],
+    pub(super) gpu_metrics: &'a [GpuMetric],
     pub(super) origin_ns: i64,
     pub(super) anchor_ns: i64,
 }
@@ -159,13 +160,15 @@ pub(super) fn emit_outputs(input: EmitInput<'_>) -> Result<EmitResult> {
         memcpys,
         runtime,
         nvtx,
+        gpu_metrics,
         origin_ns,
         anchor_ns,
     } = input;
 
     let mut writer = JsonArrayWriter::create(output_json)?;
-    let mut rows =
-        Vec::with_capacity(kernels.len() + memcpys.len() + runtime.len() + nvtx.len() * 2);
+    let mut rows = Vec::with_capacity(
+        kernels.len() + memcpys.len() + runtime.len() + nvtx.len() * 2 + gpu_metrics.len(),
+    );
     let dependencies = Vec::new();
     let mut json_event_count = 0usize;
     let mut pcie_usage_launch_dependencies = 0usize;
@@ -468,6 +471,41 @@ pub(super) fn emit_outputs(input: EmitInput<'_>) -> Result<EmitResult> {
             json_event_count += 1;
         }
     }
+    // GPU Metrics are device-wide and cannot be attributed to a CUDA process
+    // or context. Give them separate processes so the UI does not imply false
+    // ownership while preserving timestamp alignment with CUDA and NVTX.
+    let metric_devices: BTreeSet<i64> = gpu_metrics.iter().map(|metric| metric.device).collect();
+    let metric_processes: BTreeMap<i64, i64> = metric_devices
+        .iter()
+        .enumerate()
+        .map(|(index, &device)| (device, 1_800_000_000_i64 + index as i64))
+        .collect();
+    for (&device, &pid) in &metric_processes {
+        for (name, args) in [
+            (
+                "process_name",
+                json!({"name": format!("GPU Metrics / CUDA Device {device} (device-wide)")}),
+            ),
+            (
+                "process_sort_index",
+                json!({"sort_index": -20_000 + pid - 1_800_000_000_i64}),
+            ),
+        ] {
+            writer.event(&TraceEvent {
+                name: name.into(),
+                ph: "M".into(),
+                cat: "__metadata".into(),
+                ts: 0.0,
+                dur: None,
+                tid: 0,
+                pid,
+                args,
+                id: None,
+                bp: None,
+            })?;
+            json_event_count += 1;
+        }
+    }
     for &(source_pid, device, context, stream, tid, lane) in &stream_track_metadata {
         let track_name = if lane == 0 {
             format!("CUDA HW Context {context} / Stream {stream}")
@@ -666,6 +704,10 @@ pub(super) fn emit_outputs(input: EmitInput<'_>) -> Result<EmitResult> {
                 stream_sequence: None,
                 depends_on_event_id: None,
                 dependency_type: None,
+                device_id: Some(device),
+                metric_id: None,
+                metric_value: None,
+                metric_unit: None,
             });
         }
     }
@@ -751,6 +793,10 @@ pub(super) fn emit_outputs(input: EmitInput<'_>) -> Result<EmitResult> {
             stream_sequence: Some(kernel.sequence),
             depends_on_event_id: None,
             dependency_type: None,
+            device_id: Some(kernel.device),
+            metric_id: None,
+            metric_value: None,
+            metric_unit: None,
         });
 
         if let Some(call_idx) = kernel.launch_call {
@@ -920,6 +966,10 @@ pub(super) fn emit_outputs(input: EmitInput<'_>) -> Result<EmitResult> {
             stream_sequence: None,
             depends_on_event_id: None,
             dependency_type: None,
+            device_id: Some(primary_device),
+            metric_id: None,
+            metric_value: None,
+            metric_unit: None,
         });
         if let Some(call_idx) = copy.launch_call {
             let call = &runtime[call_idx];
@@ -1130,6 +1180,10 @@ pub(super) fn emit_outputs(input: EmitInput<'_>) -> Result<EmitResult> {
                 stream_sequence: None,
                 depends_on_event_id: None,
                 dependency_type: None,
+                device_id: Some(device),
+                metric_id: None,
+                metric_value: None,
+                metric_unit: None,
             });
         }
 
@@ -1157,8 +1211,61 @@ pub(super) fn emit_outputs(input: EmitInput<'_>) -> Result<EmitResult> {
                 stream_sequence: None,
                 depends_on_event_id: None,
                 dependency_type: None,
+                device_id: Some(device),
+                metric_id: None,
+                metric_value: None,
+                metric_unit: None,
             });
         }
+    }
+
+    for metric in gpu_metrics {
+        let ts_us = ns_to_us(metric.timestamp - origin_ns);
+        let args = json!({
+            "value": metric.value,
+            "deviceId": metric.device,
+            "typeId": metric.type_id,
+            "metricId": metric.metric_id,
+            "unit": metric.unit,
+            "deviceWide": true,
+        });
+        writer.event(&TraceEvent {
+            name: metric.name.clone(),
+            ph: "C".into(),
+            cat: "gpu_metrics".into(),
+            ts: ts_us,
+            dur: None,
+            tid: 0,
+            pid: metric_processes[&metric.device],
+            args: json!({"value": metric.value}),
+            id: None,
+            bp: None,
+        })?;
+        json_event_count += 1;
+        rows.push(TraceRow {
+            report: report.into(),
+            event_type: "gpu_metric".into(),
+            cat: "gpu_metrics".into(),
+            name: metric.name.clone(),
+            ph: "C".into(),
+            ts_us,
+            dur_us: None,
+            aligned_ts_us: ns_to_us(metric.timestamp - anchor_ns),
+            pid: format!("GPU Metrics / CUDA Device {} (device-wide)", metric.device),
+            tid: metric.name.clone(),
+            args_json: args.to_string(),
+            event_id: None,
+            launch_event_id: None,
+            stream_id: None,
+            correlation_id: None,
+            stream_sequence: None,
+            depends_on_event_id: None,
+            dependency_type: None,
+            device_id: Some(metric.device),
+            metric_id: Some(metric.metric_id as u32),
+            metric_value: Some(metric.value),
+            metric_unit: metric.unit.clone(),
+        });
     }
     writer.finish()?;
     Ok(EmitResult {
@@ -1174,6 +1281,9 @@ pub(super) fn emit_outputs(input: EmitInput<'_>) -> Result<EmitResult> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use flate2::read::GzDecoder;
+    use std::io::Read;
+    use std::time::{SystemTime, UNIX_EPOCH};
 
     #[test]
     fn flow_ids_are_stable_report_scoped_and_locally_unique() {
@@ -1185,5 +1295,64 @@ mod tests {
         assert_ne!(first, flow_id("rank-0", FlowKind::Kernel, 43));
         assert_eq!(first as u32, 42);
         assert!(first <= i64::MAX as u64);
+    }
+
+    #[test]
+    fn gpu_metrics_emit_device_wide_perfetto_counters_and_parquet_rows() {
+        let unique = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let output = std::env::temp_dir().join(format!(
+            "nsys2perfetto-gpu-metrics-{}-{unique}.json.gz",
+            std::process::id()
+        ));
+        let metrics = vec![GpuMetric {
+            timestamp: 1_000,
+            type_id: 0x1_0001_0000_0001,
+            device: 1,
+            metric_id: 14,
+            name: "SMs Active [Throughput %]".into(),
+            value: 73,
+            unit: Some("Throughput %".into()),
+        }];
+
+        let result = emit_outputs(EmitInput {
+            report: "metrics-only",
+            output_json: &output,
+            kernels: &[],
+            memcpys: &[],
+            runtime: &[],
+            nvtx: &[],
+            gpu_metrics: &metrics,
+            origin_ns: 1_000,
+            anchor_ns: 1_000,
+        })
+        .unwrap();
+
+        assert_eq!(result.trace_rows.len(), 1);
+        let row = &result.trace_rows[0];
+        assert_eq!(row.event_type, "gpu_metric");
+        assert_eq!(row.ph, "C");
+        assert_eq!(row.device_id, Some(1));
+        assert_eq!(row.metric_id, Some(14));
+        assert_eq!(row.metric_value, Some(73));
+
+        let mut json = String::new();
+        GzDecoder::new(File::open(&output).unwrap())
+            .read_to_string(&mut json)
+            .unwrap();
+        let events: Vec<Value> = serde_json::from_str(&json).unwrap();
+        assert!(events.iter().any(|event| {
+            event["ph"] == "C"
+                && event["name"] == "SMs Active [Throughput %]"
+                && event["args"]["value"] == 73
+        }));
+        assert!(events.iter().any(|event| {
+            event["ph"] == "M"
+                && event["args"]["name"] == "GPU Metrics / CUDA Device 1 (device-wide)"
+        }));
+
+        std::fs::remove_file(output).unwrap();
     }
 }

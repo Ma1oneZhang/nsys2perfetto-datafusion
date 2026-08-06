@@ -29,6 +29,8 @@ pub(super) async fn register_tables(ctx: &SessionContext, dir: &Path) -> Result<
         ("strings", "StringIds.parquet"),
         ("memcpy", "CUPTI_ACTIVITY_KIND_MEMCPY.parquet"),
         ("nvtx", "NVTX_EVENTS.parquet"),
+        ("gpu_metrics", "GPU_METRICS.parquet"),
+        ("gpu_metric_info", "TARGET_INFO_GPU_METRICS.parquet"),
     ];
     let mut availability = TableAvailability {
         kernels: false,
@@ -36,6 +38,8 @@ pub(super) async fn register_tables(ctx: &SessionContext, dir: &Path) -> Result<
         memcpy: false,
         nvtx: false,
         strings: false,
+        gpu_metrics: false,
+        gpu_metric_info: false,
     };
     for (name, file) in tables {
         let path = dir.join(file);
@@ -54,6 +58,8 @@ pub(super) async fn register_tables(ctx: &SessionContext, dir: &Path) -> Result<
             "strings" => availability.strings = true,
             "memcpy" => availability.memcpy = true,
             "nvtx" => availability.nvtx = true,
+            "gpu_metrics" => availability.gpu_metrics = true,
+            "gpu_metric_info" => availability.gpu_metric_info = true,
             _ => unreachable!(),
         }
     }
@@ -65,6 +71,56 @@ pub(super) async fn register_tables(ctx: &SessionContext, dir: &Path) -> Result<
         ctx.register_batch("strings", RecordBatch::new_empty(schema))?;
     }
     Ok(availability)
+}
+
+fn gpu_metric_device(type_id: i64) -> i64 {
+    type_id.rem_euclid(GLOBAL_ID_RADIX)
+}
+
+fn gpu_metric_unit(name: &str) -> Option<String> {
+    let open = name.rfind('[')?;
+    let unit = name.get(open + 1..name.len().checked_sub(1)?)?;
+    (name.ends_with(']') && !unit.is_empty()).then(|| unit.to_owned())
+}
+
+pub(super) async fn load_gpu_metrics(ctx: &SessionContext) -> Result<Vec<GpuMetric>> {
+    // metricId is only unique within one typeId. Joining on both keys keeps
+    // independently sampled devices separate in multi-GPU reports.
+    let sql = r#"
+        SELECT
+            CAST(g.timestamp AS BIGINT) AS timestamp_ns,
+            CAST(g."typeId" AS BIGINT) AS type_id,
+            CAST(g."metricId" AS BIGINT) AS metric_id,
+            CAST(g.value AS BIGINT) AS metric_value,
+            m."metricName" AS metric_name
+        FROM gpu_metrics g
+        INNER JOIN gpu_metric_info m
+            ON CAST(g."typeId" AS BIGINT) = CAST(m."typeId" AS BIGINT)
+           AND CAST(g."metricId" AS BIGINT) = CAST(m."metricId" AS BIGINT)
+        ORDER BY timestamp_ns, type_id, metric_id
+    "#;
+    let batches = ctx.sql(sql).await?.collect().await?;
+    let mut metrics = Vec::new();
+    for batch in batches {
+        let timestamp = i64_col(&batch, "timestamp_ns")?;
+        let type_id = i64_col(&batch, "type_id")?;
+        let metric_id = i64_col(&batch, "metric_id")?;
+        let value = i64_col(&batch, "metric_value")?;
+        for row in 0..batch.num_rows() {
+            let name = string_at(&batch, "metric_name", row)?;
+            let type_id = type_id.value(row);
+            metrics.push(GpuMetric {
+                timestamp: timestamp.value(row),
+                type_id,
+                device: gpu_metric_device(type_id),
+                metric_id: metric_id.value(row),
+                unit: gpu_metric_unit(&name),
+                name,
+                value: value.value(row),
+            });
+        }
+    }
+    Ok(metrics)
 }
 
 pub(super) async fn load_kernels(ctx: &SessionContext) -> Result<Vec<Kernel>> {
@@ -264,4 +320,24 @@ pub(super) async fn load_memcpys(ctx: &SessionContext) -> Result<Vec<Memcpy>> {
         }
     }
     Ok(copies)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn gpu_metric_type_id_retains_the_device_component() {
+        assert_eq!(gpu_metric_device(0x1_0001_0000_0000), 0);
+        assert_eq!(gpu_metric_device(0x1_0001_0000_0001), 1);
+    }
+
+    #[test]
+    fn gpu_metric_unit_uses_the_final_bracketed_suffix() {
+        assert_eq!(
+            gpu_metric_unit("SMs Active [Throughput %]").as_deref(),
+            Some("Throughput %")
+        );
+        assert_eq!(gpu_metric_unit("Metric without unit"), None);
+    }
 }
