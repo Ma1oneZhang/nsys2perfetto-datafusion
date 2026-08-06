@@ -38,6 +38,11 @@ The converter reads Parquet with Apache DataFusion and does not use SQLite.
 - Tracks with the same source thread ID grouped as NVTX Kernel, NVTX Thread,
   then CUDA API
 - Process-aware multi-GPU tracks so process-local device IDs cannot be conflated
+- Nsight GPU Metrics loaded from native `GPU_METRICS` and
+  `TARGET_INFO_GPU_METRICS` Parquet, joined by `(typeId, metricId)`, and emitted
+  as device-wide Perfetto counter tracks
+- GPU metric rows in aligned Parquet with raw value, unit, metric ID, and
+  device ID columns; metrics-only reports are supported
 - Dynamic device discovery with no fixed GPU-count limit; GPU-less NVTX/runtime
   processes inherit all devices observed in the trace instead of becoming
   `Device -1`
@@ -58,11 +63,12 @@ nsys export \
   report.nsys-rep
 ```
 
-The Parquet directory must include the native Nsight string, CUDA kernel, CUDA
-Runtime, memcpy, or NVTX tables used by the trace. Timeline tables are optional
-independently: missing categories are skipped, and a missing `StringIds` table
-uses stable numeric fallback names. Conversion fails only when no available
-table can produce a timeline event.
+The Parquet directory must include at least one supported native Nsight table.
+CUDA kernel, Runtime, memcpy, NVTX, and string tables are optional
+independently. GPU Metrics require both `GPU_METRICS` and
+`TARGET_INFO_GPU_METRICS`. Missing categories are skipped, and a missing
+`StringIds` table uses stable numeric fallback names. Conversion fails only
+when no available table can produce a timeline event or counter sample.
 
 `aligned_ts_us` uses the first `CriticalPath/MeasuredBatch/.../batch_0` NVTX
 range when present, and otherwise falls back to the first trace event.
@@ -93,6 +99,11 @@ CUDA Runtime API slice to the corresponding GPU kernel. Matching uses the
 Nsight `(PID, correlationId)` relationship. Memcpy API calls use the same
 relationship to link to H2D, D2H, and D2D hardware intervals. Consecutive
 kernels on a stream are intentionally not connected.
+
+GPU Metrics use Chrome Trace `C` events under
+`GPU Metrics / CUDA Device N (device-wide)`. The converter preserves Nsight's
+definitive metric names and raw integer values. These samples describe the
+whole device and are deliberately not attributed to a CUDA PID or context.
 
 The Chrome JSON uses numeric process and thread IDs plus `process_name`,
 `thread_name`, and sort-index metadata. CUDA APIs and NVTX ranges are associated

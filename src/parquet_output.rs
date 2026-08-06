@@ -20,6 +20,10 @@ pub(super) fn trace_rows_batch(rows: Vec<TraceRow>) -> Result<RecordBatch> {
         Field::new("stream_sequence", DataType::UInt64, true),
         Field::new("depends_on_event_id", DataType::Utf8, true),
         Field::new("dependency_type", DataType::Utf8, true),
+        Field::new("device_id", DataType::Int64, true),
+        Field::new("metric_id", DataType::UInt32, true),
+        Field::new("metric_value", DataType::Int64, true),
+        Field::new("metric_unit", DataType::Utf8, true),
     ]));
     RecordBatch::try_new(
         schema,
@@ -100,6 +104,20 @@ pub(super) fn trace_rows_batch(rows: Vec<TraceRow>) -> Result<RecordBatch> {
             Arc::new(StringArray::from(
                 rows.iter()
                     .map(|r| r.dependency_type.as_deref())
+                    .collect::<Vec<_>>(),
+            )),
+            Arc::new(Int64Array::from(
+                rows.iter().map(|r| r.device_id).collect::<Vec<_>>(),
+            )),
+            Arc::new(UInt32Array::from(
+                rows.iter().map(|r| r.metric_id).collect::<Vec<_>>(),
+            )),
+            Arc::new(Int64Array::from(
+                rows.iter().map(|r| r.metric_value).collect::<Vec<_>>(),
+            )),
+            Arc::new(StringArray::from(
+                rows.iter()
+                    .map(|r| r.metric_unit.as_deref())
                     .collect::<Vec<_>>(),
             )),
         ],
